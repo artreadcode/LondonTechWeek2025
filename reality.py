@@ -1,19 +1,23 @@
 import cv2
+import numpy as np
+from pythonosc.udp_client import SimpleUDPClient
 
-cv2.namedWindow("Reality?")
-vc = cv2.VideoCapture(0) # Previously: 0 -> Logitech, 1 -> Computer
+client = SimpleUDPClient("127.0.0.1", 8000)
+cap = cv2.VideoCapture(0)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-if vc.isOpened(): # Get the first frame
-    rval, frame = vc.read()
-else:
-    rval = False
-    
-while rval:
-    cv2.imshow("Reality?", frame)
-    rval, frame = vc.read()
-    
-    if cv2.waitKey(1) & 0xFF == 27: # Press 'ESC' to exit
-        break
-    
-vc.release()
-cv2.destroyWindow("Reality?")
+while True:
+    ret, frame = cap.read()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+    for i in range(10):
+        if i < len(faces):
+            (x, y, w, h) = faces[i]
+            cx = x + w // 2
+            cy = y + h // 2
+            client.send_message(f"/face{i}_x", cx / frame.shape[1])
+            client.send_message(f"/face{i}_y", 1.0 - (cy / frame.shape[0]))
+        else:
+            client.send_message(f"/face{i}_x", 0.0)
+            client.send_message(f"/face{i}_y", 0.0)
