@@ -159,7 +159,8 @@ class EdgeDetectionProcessor:
             # Convert edges to 3-channel for display
             edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
             
-            # Remove inversion to keep black background with white edges
+            # Invert colors for dramatic effect (white edges on black background)
+            edges_bgr = cv2.bitwise_not(edges_bgr)
             
             # Cache the result
             self.edge_cache = edges_bgr
