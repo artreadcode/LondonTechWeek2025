@@ -107,9 +107,31 @@ def invGrayPermutation(a):
 
 
 def convertToAngles(a):
-    """Converts image to angles"""
-    scal = np.pi / (a.max() * 2)
-    a = a * scal
+    """Converts image to angles with overflow protection"""
+    max_val = a.max()
+    
+    # Protect against overflow and edge cases
+    if max_val == 0:
+        # Avoid division by zero
+        return np.zeros_like(a, dtype=np.float64)
+    
+    # Check if max_val * 2 would overflow
+    # float64 max is ~1.8e308, so check against half of that
+    max_safe = np.finfo(np.float64).max / 4.0
+    
+    with np.errstate(over='ignore', invalid='ignore'):
+        if max_val > max_safe:
+            # For extremely large values, normalize first
+            a_normalized = a / max_val
+            scal = np.pi / 2.0
+            a = a_normalized * scal
+        else:
+            # Standard calculation
+            scal = np.pi / (max_val * 2)
+            a = a * scal
+    
+    # Ensure output is valid
+    a = np.nan_to_num(a, nan=0.0, posinf=np.pi/2, neginf=0.0)
     return a
 
 
@@ -191,8 +213,7 @@ def pad_0(img, val=0):
     Returns:
         padded image: flattened image with appropiate padding for quantum algorithm
     """
-    img = np.array(img)
-    img.flatten()
+    img = np.array(img).flatten()  # Actually flatten the array
     return np.pad(img, (0, nextpow2(len(img)) - len(img)), constant_values=val)
 
 
