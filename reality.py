@@ -359,6 +359,8 @@ class InstallationProcessor:
         
     def camera_capture_thread(self):
         """Thread for capturing camera input"""
+        OPENCV_AVFOUNDATION_SKIP_AUTH=1 
+        
         cap = cv2.VideoCapture(0)
         
         # Set camera to highest available resolution
