@@ -1,762 +1,721 @@
+"""
+Reality is Not What It Seems
+============================
+Live art installation for London Tech Week 2025 (9-11 June, Olympia London).
+Collaborative project with UAL Creative Computing Institute.
+
+Captures camera feed, detects faces, encodes them through QPIXL quantum image
+compression, and displays the result with edge-detected artistic backgrounds.
+
+Usage:
+    python reality.py                          # Default: 4K, edges-black
+    python reality.py --bg edges-white         # White background with dark edges
+    python reality.py --bg passthrough         # No edge detection, raw camera bg
+    python reality.py --resolution 1920 1080   # Custom display resolution
+    python reality.py --fullscreen             # Start in fullscreen
+    python reality.py --test                   # Static test mode (no camera)
+    python reality.py --verbose                # Print FPS and timing info
+"""
+
+import argparse
 import cv2
 import numpy as np
 import threading
 import time
-from queue import Queue
-import sys
-import os
 
-# Import the actual QPIXL modules
-import helper as hlp
-import qpixl
+import lib.helper as hlp
+import lib.qpixl as qpixl
 
-# Updated imports for Qiskit 2.0
-from qiskit import QuantumCircuit, transpile
+from qiskit import transpile
 from qiskit_aer import Aer
 from qiskit.quantum_info import Statevector
 
-
-class QuantumOperationTracker:
-    """Track and display quantum operations in real-time per face"""
-    
-    def __init__(self, max_operations=6):  # Max 6 entries as requested
-        self.max_operations = max_operations
-        self.face_operations = {}  # Store operations per face
-        self.lock = threading.Lock()
-        
-    def add_operation(self, face_id, operation_type, details=""):
-        """Add a quantum operation to the display for specific face"""
-        with self.lock:
-            if face_id not in self.face_operations:
-                self.face_operations[face_id] = []
-            
-            timestamp = time.strftime("%H:%M:%S")
-            operation = {
-                'operation': operation_type,
-                'details': details,
-                'timestamp': timestamp,
-                'time': time.time(),
-                'has_params': 'ry(' in operation_type.lower() or 'rz(' in operation_type.lower() or 'rx(' in operation_type.lower()
-            }
-            
-            self.face_operations[face_id].append(operation)
-            
-            # Keep only the most recent operations (max 6)
-            if len(self.face_operations[face_id]) > self.max_operations:
-                self.face_operations[face_id] = self.face_operations[face_id][-self.max_operations:]
-    
-    def get_face_operations(self, face_id):
-        """Get recent operations for specific face, prioritizing gates with parameters"""
-        with self.lock:
-            if face_id not in self.face_operations:
-                return []
-            
-            # Get all operations for this face
-            all_ops = self.face_operations[face_id].copy()
-            
-            # Prioritize operations with parameters (like ry, rz)
-            param_ops = [op for op in all_ops if op['has_params']]
-            other_ops = [op for op in all_ops if not op['has_params']]
-            
-            # Return parameterized gates first, then others if space remains
-            return param_ops + other_ops
-    
-    def analyze_circuit(self, circuit, face_id):
-        """Analyze a quantum circuit and extract key operations for specific face"""
-        try:
-            # Get quantum circuit metrics
-            num_qubits = circuit.num_qubits
-            circuit_depth = circuit.depth()
-            
-            # Add quantum metrics
-            self.add_operation(face_id, f"Qubits: {num_qubits}", f"Depth: {circuit_depth}")
-            
-            # Focus on collecting rotation gates with parameters
-            rotation_gates = []
-            
-            for instruction in circuit.data:
-                gate_name = instruction.operation.name.upper()
-                params = instruction.operation.params
-                qubits = [circuit.find_bit(qubit).index for qubit in instruction.qubits]
-                
-                # Collect specific gate details with parameters
-                if gate_name == 'RY' and len(params) > 0 and len(qubits) > 0:
-                    angle = float(params[0])
-                    qubit = qubits[0]
-                    rotation_gates.append((f"ry({angle:.3f}, q{qubit})", angle))
-                elif gate_name == 'RZ' and len(params) > 0 and len(qubits) > 0:
-                    angle = float(params[0])
-                    qubit = qubits[0]
-                    rotation_gates.append((f"rz({angle:.3f}, q{qubit})", angle))
-                elif gate_name == 'RX' and len(params) > 0 and len(qubits) > 0:
-                    angle = float(params[0])
-                    qubit = qubits[0]
-                    rotation_gates.append((f"rx({angle:.3f}, q{qubit})", angle))
-            
-            # Sort rotation gates by angle to show the most interesting ones
-            rotation_gates.sort(key=lambda x: abs(x[1]), reverse=True)
-            
-            # Add the most interesting rotation gates (those with largest angles)
-            for gate_detail, _ in rotation_gates[:5]:  # Show up to 5 rotation gates
-                self.add_operation(face_id, gate_detail, "")
-        
-        except Exception as e:
-            self.add_operation(face_id, "Analysis Error", str(e)[:20])
+WINDOW_NAME = "Reality?"
 
 
-class EdgeDetectionProcessor:
-    """Edge detection processor for dramatic background effects"""
-    
+# ---------------------------------------------------------------------------
+# Latest-frame holder (replaces Queue — always keep only the newest frame)
+# ---------------------------------------------------------------------------
+class LatestFrame:
+    """Thread-safe single-slot frame holder. Writers always overwrite; readers
+    always get the most recent frame (or None)."""
+
     def __init__(self):
-        self.edge_cache = None
-        self.edge_cache_time = 0
-        self.edge_cache_interval = 0.1  # Update edges frequently for dynamic effect
-        
-    def apply_edge_detection(self, frame):
-        """Apply dramatic edge detection to create artistic background"""
-        current_time = time.time()
-        
-        # Check cache to avoid recomputing every frame
-        if (self.edge_cache is not None and 
-            current_time - self.edge_cache_time < self.edge_cache_interval):
-            return self.edge_cache
-        
+        self._frame = None
+        self._lock = threading.Lock()
+
+    def put(self, frame):
+        with self._lock:
+            self._frame = frame
+
+    def get(self):
+        with self._lock:
+            frame = self._frame
+            self._frame = None
+            return frame
+
+
+# ---------------------------------------------------------------------------
+# Quantum operation tracker (per-face, bounded)
+# ---------------------------------------------------------------------------
+class QuantumOperationTracker:
+    """Track quantum circuit parameters for HUD display, per face."""
+
+    def __init__(self, max_ops=6):
+        self.max_ops = max_ops
+        self._face_ops = {}
+        self._lock = threading.Lock()
+
+    def clear_stale(self, active_face_ids):
+        """Remove data for faces no longer on screen."""
+        with self._lock:
+            stale = [fid for fid in self._face_ops if fid not in active_face_ids]
+            for fid in stale:
+                del self._face_ops[fid]
+
+    def add(self, face_id, text, has_params=False):
+        with self._lock:
+            ops = self._face_ops.setdefault(face_id, [])
+            ops.append({"text": text, "has_params": has_params})
+            if len(ops) > self.max_ops:
+                self._face_ops[face_id] = ops[-self.max_ops :]
+
+    def get(self, face_id):
+        with self._lock:
+            ops = list(self._face_ops.get(face_id, []))
+        # Prioritise parameterised gates
+        param = [o for o in ops if o["has_params"]]
+        other = [o for o in ops if not o["has_params"]]
+        return (param + other)[: self.max_ops]
+
+    def analyze_circuit(self, circuit, face_id):
         try:
-            # Convert to grayscale
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Apply Canny edge detection with strong parameters for dramatic effect
-            edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
-            
-            # Dilate edges to make them MUCH thicker and more dramatic
-            kernel = np.ones((4, 4), np.uint8)
-            edges = cv2.dilate(edges, kernel, iterations=3)
-            
-            # Convert edges to 3-channel for display
-            edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-            
-            # Invert colors for dramatic effect (white edges on black background)
-            edges_bgr = cv2.bitwise_not(edges_bgr)
-            
-            # Cache the result
-            self.edge_cache = edges_bgr
-            self.edge_cache_time = current_time
-            
-            return edges_bgr
-            
-        except Exception as e:
-            print(f"Edge detection error: {e}")
-            # Fallback to simple black background
-            return np.zeros_like(frame)
+            n_qubits = circuit.num_qubits
+            depth = circuit.depth()
+            self.add(face_id, f"Qubits: {n_qubits}  Depth: {depth}")
+
+            # Collect rotation gates grouped by qubit
+            qubit_gates = {}
+            for inst in circuit.data:
+                name = inst.operation.name.upper()
+                if name not in ("RY", "RZ", "RX") or not inst.operation.params:
+                    continue
+                angle = float(inst.operation.params[0])
+                qubit = circuit.find_bit(inst.qubits[0]).index
+                qubit_gates.setdefault(qubit, []).append((name, angle))
+
+            # Sort each qubit's gates by magnitude, take top ones
+            entries = []
+            for q, gates in qubit_gates.items():
+                gates.sort(key=lambda g: abs(g[1]), reverse=True)
+                for name, angle in gates[:2]:
+                    entries.append((abs(angle), f"{name.lower()}({angle:.3f}, q{q})"))
+            entries.sort(reverse=True)
+            for _, text in entries[:5]:
+                self.add(face_id, text, has_params=True)
+        except Exception:
+            self.add(face_id, "Analysis Error")
 
 
-class RealQPIXLProcessor:
-    """
-    Real QPIXL Quantum Pixel Processing with per-face operation tracking
-    """
-    
+# ---------------------------------------------------------------------------
+# Edge detection (operates at native resolution, cached)
+# ---------------------------------------------------------------------------
+class EdgeDetector:
+    def __init__(self, cache_interval=0.1):
+        self._cache = None
+        self._cache_time = 0.0
+        self._interval = cache_interval
+        self._kernel = np.ones((3, 3), np.uint8)
+
+    def process(self, frame, mode="edges-black"):
+        """Return edge-detected background. mode: edges-black | edges-white | passthrough"""
+        if mode == "passthrough":
+            return frame.copy()
+
+        now = time.time()
+        if self._cache is not None and now - self._cache_time < self._interval:
+            return self._cache.copy()
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
+        edges = cv2.dilate(edges, self._kernel, iterations=2)
+        result = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
+        if mode == "edges-white":
+            result = cv2.bitwise_not(result)
+
+        self._cache = result
+        self._cache_time = now
+        return result.copy()
+
+
+# ---------------------------------------------------------------------------
+# Face detector (runs on downscaled frame for speed)
+# ---------------------------------------------------------------------------
+class FaceDetector:
+    DETECT_WIDTH = 640  # Run Haar cascade at this width
+
+    def __init__(self, min_face=(60, 60)):
+        self._cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self._min_face = min_face
+
+    def detect(self, frame):
+        """Detect faces on a downscaled copy; return coords in original frame space."""
+        h, w = frame.shape[:2]
+        scale = self.DETECT_WIDTH / w
+        small = cv2.resize(frame, (self.DETECT_WIDTH, int(h * scale)))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        faces = self._cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.15,
+            minNeighbors=5,
+            minSize=self._min_face,
+            flags=cv2.CASCADE_SCALE_IMAGE,
+        )
+
+        results = []
+        inv_scale = 1.0 / scale
+        for fx, fy, fw, fh in faces:
+            # Scale back to original resolution
+            ox = int(fx * inv_scale)
+            oy = int(fy * inv_scale)
+            ow = int(fw * inv_scale)
+            oh = int(fh * inv_scale)
+
+            # Make square
+            size = max(ow, oh)
+            cx, cy = ox + ow // 2, oy + oh // 2
+            nx = max(0, cx - size // 2)
+            ny = max(0, cy - size // 2)
+
+            # Bounds check
+            if nx + size > w or ny + size > h:
+                continue
+            region = frame[ny : ny + size, nx : nx + size]
+            if region.size == 0:
+                continue
+            results.append({"region": region, "coords": (nx, ny, size, size)})
+        return results
+
+
+# ---------------------------------------------------------------------------
+# QPIXL quantum face processor
+# ---------------------------------------------------------------------------
+class QPIXLProcessor:
     def __init__(self, compression=40, verbose=False):
         self.compression = compression
-        self.backend = Aer.get_backend('statevector_simulator')
-        self.operation_tracker = QuantumOperationTracker()
-        self.verbose = verbose  # Control debug output
-        
-    def prepare_face_for_qpixl(self, face_image):
-        """Prepare face image for QPIXL processing"""
-        # Convert to grayscale if needed
-        if len(face_image.shape) == 3:
-            gray_face = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+        self.verbose = verbose
+        self.backend = Aer.get_backend("statevector_simulator")
+        self.tracker = QuantumOperationTracker()
+
+    def prepare(self, face_bgr):
+        """Convert face ROI to padded 1-D array for QPIXL."""
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY) if face_bgr.ndim == 3 else face_bgr.copy()
+        resized = cv2.resize(gray, (32, 32)).astype(np.float64)
+        resized = np.clip(resized, 0, 255)
+
+        # Guard against degenerate images
+        lo, hi = resized.min(), resized.max()
+        if hi == lo:
+            resized += np.random.uniform(-2, 2, resized.shape)
+            resized = np.clip(resized, 1, 254)
+            lo, hi = resized.min(), resized.max()
+        # Normalise to [1, 254]
+        resized = 1 + (resized - lo) * 253 / (hi - lo)
+        flat = resized.astype(np.uint8).flatten().astype(np.float64)
+        return hlp.pad_0(flat), (32, 32)
+
+    def process(self, padded, face_id=1):
+        """Run QPIXL encoding → simulation → decode. Returns 1-D pixel array."""
+        try:
+            padded = np.asarray(padded, dtype=np.float64)
+            if np.any(np.isnan(padded)) or padded.max() == padded.min():
+                raise ValueError("degenerate input")
+
+            circuit = qpixl.cFRQI(padded, self.compression)
+            self.tracker.analyze_circuit(circuit, face_id)
+
+            sv = self._run_circuit(circuit, face_id)
+            return hlp.decodeQPIXL(sv.probabilities(), min_pixel_val=0, max_pixel_val=255)
+        except Exception as e:
+            if self.verbose:
+                print(f"  QPIXL error face {face_id}: {e}")
+            self.tracker.add(face_id, "QPIXL Error")
+            return self._fallback(padded)
+
+    def _run_circuit(self, circuit, face_id):
+        """Try multiple execution strategies."""
+        # Strategy 1: transpile + run
+        try:
+            tc = transpile(circuit, self.backend, optimization_level=0)
+            return self.backend.run(tc).result().get_statevector()
+        except Exception:
+            pass
+        # Strategy 2: direct run
+        try:
+            return self.backend.run(circuit).result().get_statevector()
+        except Exception:
+            pass
+        # Strategy 3: Statevector.from_instruction
+        return Statevector.from_instruction(circuit)
+
+    def _fallback(self, padded):
+        arr = np.asarray(padded[:1024], dtype=np.float64)
+        return np.clip(arr * 0.8 + np.random.normal(0, 10, arr.shape), 0, 255)
+
+    def reconstruct(self, decoded, shape=(32, 32)):
+        """Decoded 1-D → 2-D uint8 image."""
+        n = shape[0] * shape[1]
+        if len(decoded) > n:
+            decoded = decoded[:n]
+        elif len(decoded) < n:
+            decoded = np.concatenate([decoded, np.zeros(n - len(decoded))])
+        img = hlp.reconstruct_img(decoded, shape).T
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# HUD / overlay drawing
+# ---------------------------------------------------------------------------
+FACE_COLORS = [
+    (0, 255, 255),
+    (255, 0, 255),
+    (255, 255, 0),
+    (0, 255, 0),
+    (255, 0, 0),
+    (0, 0, 255),
+]
+
+
+def _draw_panel(frame, face_id, coords, ops, scale):
+    """Draw quantum parameter panel next to a face. Uses ROI-only blending."""
+    x, y, w, h = coords
+    color = FACE_COLORS[face_id % len(FACE_COLORS)]
+
+    # Panel dimensions scaled to frame size
+    pw = int(400 * scale)
+    ph = int(300 * scale)
+
+    # Position: right of face if room, else left
+    fwidth = frame.shape[1]
+    fheight = frame.shape[0]
+    gap = int(25 * scale)
+    if x + w + pw + gap < fwidth:
+        px = x + w + gap
+    else:
+        px = max(gap, x - pw - gap)
+    py = max(gap, min(y, fheight - ph - gap))
+
+    # Clamp to frame bounds
+    px2 = min(px + pw, fwidth)
+    py2 = min(py + ph, fheight)
+    if px2 - px < 50 or py2 - py < 50:
+        return  # not enough room
+
+    # ROI-only semi-transparent background (no full-frame copy)
+    roi = frame[py:py2, px:px2]
+    dark = np.zeros_like(roi)
+    cv2.addWeighted(roi, 0.25, dark, 0.75, 0, roi)
+    frame[py:py2, px:px2] = roi
+
+    # Border
+    thickness = max(2, int(3 * scale))
+    cv2.rectangle(frame, (px, py), (px2, py2), color, thickness)
+
+    # Title
+    fs_title = 1.2 * scale
+    fs_body = 0.8 * scale
+    lh = int(30 * scale)
+    tx, ty = px + int(15 * scale), py + int(35 * scale)
+
+    cv2.putText(frame, f"FACE {face_id}", (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, fs_title, color, max(1, int(3 * scale)))
+    ty += lh
+    cv2.putText(frame, "QUANTUM PARAMETERS", (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, fs_body * 0.8, (255, 255, 255), max(1, int(2 * scale)))
+    ty += int(10 * scale)
+    cv2.line(frame, (tx, ty), (px2 - int(15 * scale), ty), color, max(1, int(2 * scale)))
+    ty += lh
+
+    for op in ops:
+        if ty + lh > py2 - int(10 * scale):
+            break
+        text = op["text"]
+        if "ry(" in text.lower():
+            c = (0, 255, 255)
+        elif "rz(" in text.lower():
+            c = (255, 100, 255)
+        elif "rx(" in text.lower():
+            c = (100, 255, 255)
+        elif "qubits:" in text.lower():
+            c = (0, 255, 0)
         else:
-            gray_face = face_image.copy()
-        
-        # Use 32x32 for faster processing in real-time installation
-        target_size = 32
-        resized_face = cv2.resize(gray_face, (target_size, target_size))
-        
-        # Flatten and pad to next power of 2 if needed
-        flattened = resized_face.flatten()
-        padded = hlp.pad_0(flattened)
-        
-        return padded, (target_size, target_size)
-    
-    def process_face_with_qpixl(self, face_data, face_id=1):
-        """Process face using the real QPIXL algorithm with operation tracking"""
-        try:
-            # Use the standard version for better performance
-            circuit = qpixl.cFRQI(face_data, self.compression)
-        
-            # Analyze and track only the quantum gate operations for this specific face
-            self.operation_tracker.analyze_circuit(circuit, face_id)
-        
-            # Try multiple transpilation strategies
-            statevector = None
-        
-            # Strategy 1: Try with minimal optimization
-            try:
-                transpiled_circuit = transpile(circuit, self.backend, optimization_level=0)
-                job = self.backend.run(transpiled_circuit)
-                result = job.result()
-                statevector = result.get_statevector()
-                if self.verbose:
-                    print(f"Face {face_id}: Transpilation successful with optimization_level=0")
-            except Exception as e:
-                if self.verbose:
-                    print(f"Face {face_id}: Transpilation failed with optimization_level=0: {e}")
-            
-            # Strategy 2: Try without transpilation (direct execution)
-            if statevector is None:
-                try:
-                    job = self.backend.run(circuit)
-                    result = job.result()
-                    statevector = result.get_statevector()
-                    if self.verbose:
-                        print(f"Face {face_id}: Direct execution successful (no transpilation)")
-                except Exception as e2:
-                    if self.verbose:
-                        print(f"Face {face_id}: Direct execution failed: {e2}")
-            
-            # Strategy 3: Use Statevector directly
-            if statevector is None:
-                try:
-                    statevector = Statevector.from_instruction(circuit)
-                    if self.verbose:
-                        print(f"Face {face_id}: Statevector creation successful")
-                except Exception as e3:
-                    if self.verbose:
-                        print(f"Face {face_id}: Statevector creation failed: {e3}")
-                    raise e3
-        
-            if statevector is None:
-                raise Exception("All quantum execution strategies failed")
-        
-            # Decode the quantum state back to image
-            decoded = hlp.decodeQPIXL(
-                statevector.probabilities(),
-                min_pixel_val=0,
-                max_pixel_val=255
-            )
-        
-            return decoded
-        
-        except Exception as e:
-            if self.verbose:
-                print(f"QPIXL processing error for face {face_id}: {e}")
-            # Add error to operations
-            self.operation_tracker.add_operation(face_id, "QPIXL Error", str(e)[:20])
-            # Return a simple processed version of the original data
-            return self.fallback_processing(face_data)
-    
-    def fallback_processing(self, face_data):
-        """Fallback processing when quantum processing fails"""
-        # Simple classical processing as fallback
-        processed = np.array(face_data[:1024])  # Take first 1024 elements for 32x32
-        
-        # Apply some classical "quantum-like" effects
-        processed = processed * 0.8 + np.random.normal(0, 10, processed.shape)
-        processed = np.clip(processed, 0, 255)
-        
-        return processed
-    
-    def reconstruct_face_image(self, decoded_data, original_shape):
-        """Reconstruct the face image from decoded QPIXL data"""
-        try:
-            # Trim padding if necessary
-            expected_size = original_shape[0] * original_shape[1]
-            if len(decoded_data) > expected_size:
-                decoded_data = decoded_data[:expected_size]
-            elif len(decoded_data) < expected_size:
-                # Pad if too small
-                padding = np.zeros(expected_size - len(decoded_data))
-                decoded_data = np.concatenate([decoded_data, padding])
-            
-            # Reshape back to image and fix rotation
-            reconstructed = hlp.reconstruct_img(decoded_data, original_shape)
-            reconstructed = reconstructed.T  # Fix rotation issue
-            
-            # Ensure values are in valid range
-            reconstructed = np.clip(reconstructed, 0, 255).astype(np.uint8)
-            
-            return reconstructed
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"Reconstruction error: {e}")
-            # Return a simple pattern if reconstruction fails
-            pattern = np.random.randint(0, 256, original_shape, dtype=np.uint8)
-            return pattern
+            c = (200, 200, 200)
+
+        fs = fs_body * (1.2 if op["has_params"] else 1.0)
+        cv2.putText(frame, text, (tx + int(10 * scale), ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, c, max(1, int(2 * scale)))
+        ty += lh
+
+    # Connection line from face centre to panel edge
+    fcx, fcy = x + w // 2, y + h // 2
+    pcx = px if px > x else px2
+    pcy = py + int(50 * scale)
+    cv2.line(frame, (fcx, fcy), (pcx, pcy), color, max(1, int(2 * scale)))
 
 
-class FaceDetector:
-    """Face detection optimized for installation"""
-    
-    def __init__(self, verbose=False):
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        # For installation, detect larger faces (people standing further back)
-        self.min_face_size = (80, 80)  # Minimum face size for detection
-        self.verbose = verbose
-    
-    def detect_faces(self, frame):
-        """Detect faces and return square regions"""
-        try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Optimized parameters for installation environment
-            faces = self.face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1, 
-                minNeighbors=5,
-                minSize=self.min_face_size,
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-            
-            face_regions = []
-            for (x, y, w, h) in faces:
-                # Make it square by using the larger dimension
-                size = max(w, h)
-                # Center the square
-                center_x = x + w // 2
-                center_y = y + h // 2
-                new_x = max(0, center_x - size // 2)
-                new_y = max(0, center_y - size // 2)
-                
-                # Ensure we don't go out of bounds
-                if new_x + size <= frame.shape[1] and new_y + size <= frame.shape[0]:
-                    face_region = frame[new_y:new_y+size, new_x:new_x+size]
-                    if face_region.size > 0:
-                        face_regions.append({
-                            'region': face_region,
-                            'coords': (new_x, new_y, size, size)
-                        })
-            
-            return face_regions
-        except Exception as e:
-            if self.verbose:
-                print(f"Face detection error: {e}")
-            return []
+def _draw_title(frame, scale):
+    """Draw centred title and subtitle."""
+    fh, fw = frame.shape[:2]
+    title = "REALITY IS NOT WHAT IT SEEMS"
+    fs = 1.8 * scale
+    th = max(2, int(4 * scale))
+    (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    tx = (fw - tw) // 2
+    ty = int(70 * scale)
+    # Shadow
+    cv2.putText(frame, title, (tx + 2, ty + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2)
+    cv2.putText(frame, title, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th)
+
+    sub = "View reality through quantum algorithm."
+    fs2 = 0.9 * scale
+    th2 = max(1, int(2 * scale))
+    (sw, _), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, fs2, th2)
+    sx = (fw - sw) // 2
+    sy = ty + int(45 * scale)
+    cv2.putText(frame, sub, (sx + 1, sy + 1),
+                cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 0, 0), th2 + 1)
+    cv2.putText(frame, sub, (sx, sy),
+                cv2.FONT_HERSHEY_SIMPLEX, fs2, (255, 255, 0), th2)
 
 
+def _draw_face_count(frame, count, scale):
+    if count > 0:
+        fw = frame.shape[1]
+        fs = 1.2 * scale
+        cv2.putText(frame, f"Faces: {count}", (fw - int(220 * scale), int(50 * scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), max(1, int(3 * scale)))
+
+
+# ---------------------------------------------------------------------------
+# Main installation processor
+# ---------------------------------------------------------------------------
 class InstallationProcessor:
-    """Main processor for the 4K installation display with edge detection background"""
-    
-    def __init__(self, compression=40, target_resolution=(3840, 2160), verbose=False):
-        self.face_detector = FaceDetector(verbose)
-        self.qpixl_processor = RealQPIXLProcessor(compression, verbose)
-        self.edge_processor = EdgeDetectionProcessor()  # New edge detection processor
-        self.input_queue = Queue(maxsize=3)  # Smaller queue for real-time performance
-        self.output_queue = Queue(maxsize=3)
-        self.processing = False
-        self.compression = compression
-        self.target_resolution = target_resolution
-        self.face_cache = {}  # Cache processed faces to reduce computation
-        self.cache_timeout = 2.0  # Reduced cache timeout to show parameter changes more frequently
-        self.error_count = 0
-        self.success_count = 0
-        self.show_operations = True  # Toggle for operation display
-        self.verbose = verbose
-        
-    def camera_capture_thread(self):
-        """Thread for capturing camera input"""
-        OPENCV_AVFOUNDATION_SKIP_AUTH=1 
-        
+    def __init__(self, args):
+        self.bg_mode = args.bg
+        self.display_res = tuple(args.resolution)
+        self.compression = args.compression
+        self.verbose = args.verbose
+        self.start_fullscreen = args.fullscreen
+        self.show_panels = True
+
+        self.face_detector = FaceDetector()
+        self.qpixl = QPIXLProcessor(self.compression, self.verbose)
+        self.edge_detector = EdgeDetector()
+
+        self._latest_input = LatestFrame()
+        self._latest_output = LatestFrame()
+        self._running = False
+
+        self._face_cache = {}
+        self._cache_timeout = 2.0
+        self._stats_lock = threading.Lock()
+        self._success = 0
+        self._errors = 0
+
+    # --- threads -----------------------------------------------------------
+
+    def _camera_thread(self):
         cap = cv2.VideoCapture(0)
-        
-        # Set camera to highest available resolution
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FPS, 30)
-        
         if self.verbose:
-            print(f"Camera initialized at {cap.get(cv2.CAP_PROP_FRAME_WIDTH)}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT)}")
-        
-        while self.processing:
+            w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            print(f"Camera: {w:.0f}x{h:.0f}")
+
+        while self._running:
             ret, frame = cap.read()
             if ret:
-                # Resize to target resolution for display
-                frame_resized = cv2.resize(frame, self.target_resolution)
-                
-                if not self.input_queue.full():
-                    self.input_queue.put(frame_resized)
-            time.sleep(0.033)  # ~30 FPS capture
-        
+                self._latest_input.put(frame)
+            # No sleep — cap.read() already blocks at camera FPS
         cap.release()
-    
-    def draw_face_quantum_panel(self, frame, face_id, coords, operations):
-        """Draw individual quantum operations panel for each face with MUCH bigger text"""
-        x, y, w, h = coords
-        
-        # Panel positioning - place next to face
-        panel_width = 800  # Bigger panel
-        panel_height = 600  # Bigger panel
-        
-        # Position panel to the right of face if possible, otherwise to the left
-        if x + w + panel_width + 50 < frame.shape[1]:
-            panel_x = x + w + 50
-        else:
-            panel_x = max(50, x - panel_width - 50)
-        
-        panel_y = max(50, min(y, frame.shape[0] - panel_height - 50))
-        
-        # Create semi-transparent background
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (panel_x, panel_y), 
-                     (panel_x + panel_width, panel_y + panel_height), 
-                     (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
-        
-        # Draw panel border with face-specific color
-        colors = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 0), (255, 0, 0), (0, 0, 255)]
-        panel_color = colors[face_id % len(colors)]
-        
-        cv2.rectangle(frame, (panel_x, panel_y), 
-                     (panel_x + panel_width, panel_y + panel_height), 
-                     panel_color, 8)  # Thick border
-        
-        # DRAMATICALLY BIGGER title
-        cv2.putText(frame, f"FACE {face_id}", (panel_x + 30, panel_y + 80), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 3.0, panel_color, 8)  # MUCH bigger
-        
-        cv2.putText(frame, "QUANTUM PARAMETERS", (panel_x + 30, panel_y + 150), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 4)  # Bigger
-        
-        # Draw line separator
-        cv2.line(frame, (panel_x + 30, panel_y + 170), 
-                (panel_x + panel_width - 30, panel_y + 170), panel_color, 4)
-        
-        # Display quantum operations with MUCH bigger text
-        y_offset = panel_y + 220
-        line_height = 60  # Much bigger line spacing
-        
-        # Show most recent operations (max 6)
-        # Prioritize operations with parameters
-        param_ops = [op for op in operations if op['has_params']]
-        other_ops = [op for op in operations if not op['has_params']]
-        
-        # Show parameterized gates first
-        display_ops = param_ops + other_ops
-        display_ops = display_ops[:6]  # Limit to 6 total
-        
-        for i, op in enumerate(display_ops):
-            if y_offset + line_height > panel_y + panel_height - 50:
-                break
-            
-            # Color code by operation type
-            if 'ry(' in op['operation'].lower():
-                color = (0, 255, 255)  # Cyan for RY gates
-            elif 'rz(' in op['operation'].lower():
-                color = (255, 100, 255)  # Pink for RZ gates
-            elif 'rx(' in op['operation'].lower():
-                color = (100, 255, 255)  # Light blue for RX gates
-            elif 'qubits:' in op['operation'].lower():
-                color = (0, 255, 0)    # Green for qubit info
-            elif 'error' in op['operation'].lower():
-                color = (0, 0, 255)    # Red for errors
-            else:
-                color = (200, 200, 200)  # Gray for other operations
-            
-            # Draw operation with DRAMATICALLY bigger text
-            operation_text = op['operation']
-            
-            # EXTRA LARGE text for parameterized gates
-            if op['has_params']:
-                cv2.putText(frame, operation_text, (panel_x + 50, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 5)  # EXTRA big for parameters
-            else:
-                cv2.putText(frame, operation_text, (panel_x + 50, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)  # Normal big for others
-            
-            y_offset += line_height
-        
-        # Draw connection line from face to panel
-        face_center_x = x + w // 2
-        face_center_y = y + h // 2
-        panel_connect_x = panel_x if panel_x > x else panel_x + panel_width
-        panel_connect_y = panel_y + 100
-        
-        cv2.line(frame, (face_center_x, face_center_y), 
-                (panel_connect_x, panel_connect_y), panel_color, 6)  # Thick connection line
-    
-    def face_processing_thread(self):
-        """Thread for processing detected faces with real QPIXL and edge detection background"""
-        while self.processing:
-            try:
-                if not self.input_queue.empty():
-                    frame = self.input_queue.get()
-                    current_time = time.time()
-                    
-                    # Apply dramatic edge detection to background
-                    edge_background = self.edge_processor.apply_edge_detection(frame)
-                    
-                    # Detect faces
-                    face_regions = self.face_detector.detect_faces(frame)
-                    
-                    # Start with the edge-detected background
-                    output_frame = edge_background.copy()
-                    
-                    # Process each detected face
-                    for i, face_data in enumerate(face_regions):
-                        try:
-                            face_region = face_data['region']
-                            coords = face_data['coords']
-                            x, y, w, h = coords
-                            
-                            # Draw square outline around face with thick border
-                            colors = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 0), (255, 0, 0), (0, 0, 255)]
-                            face_color = colors[i % len(colors)]
-                            cv2.rectangle(output_frame, (x, y), (x+w, y+h), face_color, 8)  # Thick square outline
-                            
-                            # Create a cache key based on face position and size
-                            cache_key = f"{x//30}_{y//30}_{w//30}_{h//30}"  # Larger quantization for more cache hits
-                            
-                            # Check if we have a recent processed version of this face
-                            if (cache_key in self.face_cache and 
-                                current_time - self.face_cache[cache_key]['timestamp'] < self.cache_timeout):
-                                # Use cached processed face
-                                processed_face_bgr = self.face_cache[cache_key]['processed']
-                                if self.verbose:
-                                    print(f"Using cached face {i+1}")
-                            else:
-                                # Process new face with QPIXL
-                                if self.verbose:
-                                    print(f"Processing new face {i+1}/{len(face_regions)}...")
-                                
-                                # Prepare face for QPIXL
-                                face_array, original_shape = self.qpixl_processor.prepare_face_for_qpixl(face_region)
-                                
-                                # Apply QPIXL quantum processing with face ID for operation tracking
-                                processed_data = self.qpixl_processor.process_face_with_qpixl(face_array, face_id=i+1)
-                                self.success_count += 1
-                                
-                                # Reconstruct the processed face
-                                processed_face = self.qpixl_processor.reconstruct_face_image(processed_data, original_shape)
-                                
-                                # Convert to BGR for display
-                                processed_face_bgr = cv2.cvtColor(processed_face, cv2.COLOR_GRAY2BGR)
-                                
-                                # Apply quantum-inspired color effects
-                                processed_face_hsv = cv2.cvtColor(processed_face_bgr, cv2.COLOR_BGR2HSV)
-                                
-                                # Create quantum color shift based on face position
-                                hue_shift = (x + y) % 180
-                                processed_face_hsv[:,:,0] = (processed_face_hsv[:,:,0] + hue_shift) % 180
-                                processed_face_hsv[:,:,1] = np.clip(processed_face_hsv[:,:,1] * 1.3, 0, 255)  # Increase saturation
-                                processed_face_hsv[:,:,2] = np.clip(processed_face_hsv[:,:,2] * 1.1, 0, 255)  # Increase brightness
-                                
-                                processed_face_bgr = cv2.cvtColor(processed_face_hsv, cv2.COLOR_HSV2BGR)
-                                
-                                # Cache the processed face
-                                self.face_cache[cache_key] = {
-                                    'processed': processed_face_bgr,
-                                    'timestamp': current_time
-                                }
-                                
-                                if self.verbose:
-                                    print(f"Face {i+1} processed and cached successfully")
-                            
-                            # Get the exact dimensions of the target region
-                            target_region = output_frame[y:y+h, x:x+w]
-                            target_height, target_width = target_region.shape[:2]
-                            
-                            # Resize processed face to EXACTLY match the target region dimensions
-                            processed_face_resized = cv2.resize(processed_face_bgr, (target_width, target_height))
-                            
-                            # Verify dimensions match before assignment
-                            if processed_face_resized.shape == target_region.shape:
-                                # Replace the face region with the quantum-processed square
-                                output_frame[y:y+h, x:x+w] = processed_face_resized
-                            else:
-                                if self.verbose:
-                                    print(f"Dimension mismatch: processed {processed_face_resized.shape} vs target {target_region.shape}")
-                            
-                            # Draw individual quantum operations panel for this face
-                            if self.show_operations:
-                                operations = self.qpixl_processor.operation_tracker.get_face_operations(i+1)
-                                self.draw_face_quantum_panel(output_frame, i+1, coords, operations)
-                        
-                        except Exception as face_error:
-                            if self.verbose:
-                                print(f"Error processing face {i+1}: {face_error}")
-                            self.error_count += 1
-                            # Draw error indicator
-                            cv2.rectangle(output_frame, (x, y), (x+w, y+h), (0, 0, 255), 8)  # Red border for error
-                    
-                    # Clean up old cache entries
-                    self.cleanup_cache(current_time)
-                    
-                    # Add installation info overlay with BIGGER text
-                    self.add_info_overlay(output_frame, len(face_regions))
-                    
-                    if not self.output_queue.full():
-                        self.output_queue.put(output_frame)
-                
-                else:
-                    time.sleep(0.01)
-            
-            except Exception as thread_error:
-                if self.verbose:
-                    print(f"Face processing thread error: {thread_error}")
-                self.error_count += 1
-                time.sleep(0.1)  # Brief pause before retrying
-    
-    def cleanup_cache(self, current_time):
-        """Remove old entries from face cache"""
-        keys_to_remove = []
-        for key, data in self.face_cache.items():
-            if current_time - data['timestamp'] > self.cache_timeout * 2:
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            del self.face_cache[key]
-    
-    def add_info_overlay(self, frame, face_count):
-        """Add installation information overlay with philosophical title"""
-        height, width = frame.shape[:2]
-        
-        # Add main philosophical title at the top center
-        title_text = "REALITY IS NOT WHAT IT SEEMS"
-        title_font_scale = 3.5
-        title_thickness = 8
-        
-        # Calculate text size to center it
-        (title_width, title_height), _ = cv2.getTextSize(title_text, cv2.FONT_HERSHEY_SIMPLEX, title_font_scale, title_thickness)
-        title_x = (width - title_width) // 2
-        title_y = 120
-        
-        # Add title with dramatic white text and black outline
-        cv2.putText(frame, title_text, (title_x + 4, title_y + 4), 
-                   cv2.FONT_HERSHEY_SIMPLEX, title_font_scale, (0, 0, 0), title_thickness + 4)  # Black outline
-        cv2.putText(frame, title_text, (title_x, title_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, title_font_scale, (255, 255, 255), title_thickness)  # White text
-        
-        # Add subtitle below the main title
-        subtitle_text = "View reality through quantum algorithm."
-        subtitle_font_scale = 1.8
-        subtitle_thickness = 4
-        
-        # Calculate subtitle position
-        (subtitle_width, subtitle_height), _ = cv2.getTextSize(subtitle_text, cv2.FONT_HERSHEY_SIMPLEX, subtitle_font_scale, subtitle_thickness)
-        subtitle_x = (width - subtitle_width) // 2
-        subtitle_y = title_y + 80
-        
-        # Add subtitle with cyan color and black outline
-        cv2.putText(frame, subtitle_text, (subtitle_x + 2, subtitle_y + 2), 
-                   cv2.FONT_HERSHEY_SIMPLEX, subtitle_font_scale, (0, 0, 0), subtitle_thickness + 2)  # Black outline
-        cv2.putText(frame, subtitle_text, (subtitle_x, subtitle_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, subtitle_font_scale, (255, 255, 0), subtitle_thickness)  # Cyan text
-        
-        # Add face count in top-right corner
-        if face_count > 0:
-            cv2.putText(frame, f"Faces: {face_count}", (width - 400, 80), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 0), 6)
-    
-    def run(self, verbose=False):
-        """Main execution method for installation"""
-        self.verbose = verbose
-        
-        if verbose:
-            print("=" * 60)
-            print("Reality is Not What It Seems.")
-            print("=" * 60)
-            print(f"Target Resolution: {self.target_resolution[0]}x{self.target_resolution[1]}")
-            print(f"Quantum Compression: {self.compression}%")
-            print("Features:")
-            print("- EDGE DETECTION BACKGROUND")
-            print("- Individual quantum panels per face")
-            print("- Live updating gate parameters (max 6)")
-            print("- PRIORITIZED PARAMETER DISPLAY")
-            print("- Square face outlines")
-            print("- Dramatic artistic background")
-            print("- DRAMATICALLY bigger text")
-            print()
-            print("Controls:")
-            print("- 'q' - quit")
-            print("- 'f' - fullscreen")
-            print("- 'o' - toggle quantum panels")
-            print("=" * 60)
-        
-        self.processing = True
-        
-        # Start background threads
-        camera_thread = threading.Thread(target=self.camera_capture_thread)
-        processing_thread = threading.Thread(target=self.face_processing_thread)
-        
-        camera_thread.start()
-        processing_thread.start()
-        
-        # Create fullscreen window for installation
-        cv2.namedWindow('Reality?', cv2.WINDOW_NORMAL)
-        
-        # Main display loop
+
+    def _processing_thread(self):
+        fps_time = time.time()
+        fps_count = 0
+
+        while self._running:
+            frame = self._latest_input.get()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            t0 = time.time()
+
+            # 1. Edge detection at native camera resolution
+            background = self.edge_detector.process(frame, self.bg_mode)
+
+            # 2. Face detection on downscaled copy
+            faces = self.face_detector.detect(frame)
+
+            # 3. Compose output at native resolution
+            output = background  # already a copy from EdgeDetector
+
+            now = time.time()
+            active_ids = set()
+
+            for i, face in enumerate(faces):
+                fid = i + 1
+                active_ids.add(fid)
+                try:
+                    region = face["region"]
+                    x, y, w, h = face["coords"]
+                    color = FACE_COLORS[i % len(FACE_COLORS)]
+
+                    # Face outline
+                    cv2.rectangle(output, (x, y), (x + w, y + h), color, max(2, w // 40))
+
+                    # Cache lookup
+                    ckey = f"{x // 30}_{y // 30}_{w // 30}"
+                    cached = self._face_cache.get(ckey)
+                    if cached and now - cached["time"] < self._cache_timeout:
+                        proc_bgr = cached["img"]
+                    else:
+                        padded, shape = self.qpixl.prepare(region)
+                        decoded = self.qpixl.process(padded, fid)
+                        gray_face = self.qpixl.reconstruct(decoded, shape)
+                        proc_bgr = cv2.cvtColor(gray_face, cv2.COLOR_GRAY2BGR)
+
+                        # Colour shift
+                        hsv = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2HSV)
+                        hue_shift = (x + y) % 180
+                        hsv[:, :, 0] = (hsv[:, :, 0].astype(np.int16) + hue_shift) % 180
+                        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.3, 0, 255).astype(np.uint8)
+                        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.1, 0, 255).astype(np.uint8)
+                        proc_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+                        self._face_cache[ckey] = {"img": proc_bgr, "time": now}
+                        with self._stats_lock:
+                            self._success += 1
+
+                    # Stamp processed face into output
+                    target = output[y : y + h, x : x + w]
+                    resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]))
+                    if resized.shape == target.shape:
+                        output[y : y + h, x : x + w] = resized
+
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  Face {fid} error: {e}")
+                    with self._stats_lock:
+                        self._errors += 1
+
+            # Clean stale caches
+            self._cleanup_cache(now)
+            self.qpixl.tracker.clear_stale(active_ids)
+
+            # HUD scale factor (relative to 1080p)
+            scale = output.shape[0] / 1080.0
+
+            # Draw panels
+            if self.show_panels:
+                for i, face in enumerate(faces):
+                    fid = i + 1
+                    ops = self.qpixl.tracker.get(fid)
+                    _draw_panel(output, fid, face["coords"], ops, scale)
+
+            _draw_title(output, scale)
+            _draw_face_count(output, len(faces), scale)
+
+            # 4. Upscale to display resolution ONCE
+            if (output.shape[1], output.shape[0]) != self.display_res:
+                output = cv2.resize(output, self.display_res)
+
+            self._latest_output.put(output)
+
+            # FPS counter
+            fps_count += 1
+            elapsed = time.time() - fps_time
+            if self.verbose and elapsed >= 2.0:
+                print(f"Processing FPS: {fps_count / elapsed:.1f}  "
+                      f"Frame time: {(time.time() - t0) * 1000:.0f}ms  "
+                      f"Faces: {len(faces)}")
+                fps_count = 0
+                fps_time = time.time()
+
+    def _cleanup_cache(self, now):
+        stale = [k for k, v in self._face_cache.items()
+                 if now - v["time"] > self._cache_timeout * 2]
+        for k in stale:
+            del self._face_cache[k]
+
+    # --- main loop ---------------------------------------------------------
+
+    def run(self):
+        if self.verbose:
+            print("=" * 50)
+            print("Reality is Not What It Seems")
+            print("=" * 50)
+            print(f"Display: {self.display_res[0]}x{self.display_res[1]}")
+            print(f"Background: {self.bg_mode}")
+            print(f"Compression: {self.compression}%")
+            print("Controls: q=quit  f=fullscreen  o=toggle panels  v=verbose")
+            print("=" * 50)
+
+        self._running = True
+
+        cam = threading.Thread(target=self._camera_thread, daemon=True)
+        proc = threading.Thread(target=self._processing_thread, daemon=True)
+        cam.start()
+        proc.start()
+
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        if self.start_fullscreen:
+            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
         try:
-            while self.processing:
-                if not self.output_queue.empty():
-                    output_frame = self.output_queue.get()
-                    
-                    # Display the frame
-                    cv2.imshow('Reality?', output_frame)
-                    
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        self.processing = False
-                        break
-                    elif key == ord('f'):
-                        # Toggle fullscreen
-                        current_prop = cv2.getWindowProperty('Reality?', cv2.WND_PROP_FULLSCREEN)
-                        if current_prop == cv2.WINDOW_FULLSCREEN:
-                            cv2.setWindowProperty('Reality?', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-                        else:
-                            cv2.setWindowProperty('Reality?', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                    elif key == ord('o'):
-                        # Toggle operations display
-                        self.show_operations = not self.show_operations
-                        if self.verbose:
-                            print(f"Quantum operations display: {'ON' if self.show_operations else 'OFF'}")
-                    elif key == ord('v'):
-                        # Toggle verbose mode
-                        self.verbose = not self.verbose
-                        self.face_detector.verbose = self.verbose
-                        self.qpixl_processor.verbose = self.verbose
-                        if self.verbose:
-                            print("Verbose mode: ON")
-                        else:
-                            print("Verbose mode: OFF")
-                else:
-                    time.sleep(0.01)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        self.processing = False
-                        break
-        
+            while self._running:
+                output = self._latest_output.get()
+                if output is not None:
+                    cv2.imshow(WINDOW_NAME, output)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("f"):
+                    prop = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+                    new = cv2.WINDOW_NORMAL if prop == cv2.WINDOW_FULLSCREEN else cv2.WINDOW_FULLSCREEN
+                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, new)
+                elif key == ord("o"):
+                    self.show_panels = not self.show_panels
+                elif key == ord("v"):
+                    self.verbose = not self.verbose
+                    self.qpixl.verbose = self.verbose
+
         except KeyboardInterrupt:
-            if verbose:
-                print("\nInstallation stopped by user")
-            self.processing = False
+            pass
         finally:
-            # Ensure we clean up properly
-            self.processing = False
-            if verbose:
-                print("Waiting for threads to finish...")
-        
-        # Cleanup
-        camera_thread.join()
-        processing_thread.join()
-        cv2.destroyAllWindows()
-        
-        if verbose:
-            print(f"Installation stopped. Final stats - Success: {self.success_count}, Errors: {self.error_count}")
+            self._running = False
+            if self.verbose:
+                with self._stats_lock:
+                    print(f"\nDone. Success: {self._success}  Errors: {self._errors}")
+            cv2.destroyAllWindows()
+
+
+# ---------------------------------------------------------------------------
+# Static test mode (no camera required)
+# ---------------------------------------------------------------------------
+def run_test(args):
+    """Run the full pipeline on a static image or generated test pattern."""
+    print("=== Static Pipeline Test ===\n")
+
+    # Load or generate test image
+    if args.test_image:
+        img = cv2.imread(args.test_image)
+        if img is None:
+            print(f"Error: cannot read {args.test_image}")
+            return
+        print(f"Loaded: {args.test_image}  ({img.shape[1]}x{img.shape[0]})")
+    else:
+        # Generate 640x480 test image with a synthetic "face-like" pattern
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        img[:] = (80, 80, 80)
+        # Draw an ellipse as a rough face
+        cv2.ellipse(img, (320, 240), (80, 100), 0, 0, 360, (200, 180, 160), -1)
+        cv2.circle(img, (295, 220), 10, (50, 50, 50), -1)  # left eye
+        cv2.circle(img, (345, 220), 10, (50, 50, 50), -1)  # right eye
+        cv2.ellipse(img, (320, 270), (25, 10), 0, 0, 360, (100, 80, 80), -1)  # mouth
+        print("Using generated test pattern (640x480)")
+
+    # 1. Edge detection
+    edge_det = EdgeDetector()
+    t0 = time.time()
+    bg = edge_det.process(img, args.bg)
+    t_edge = time.time() - t0
+    print(f"[1] Edge detection ({args.bg}): {t_edge * 1000:.1f} ms")
+
+    # 2. Face detection
+    face_det = FaceDetector()
+    t0 = time.time()
+    faces = face_det.detect(img)
+    t_face = time.time() - t0
+    print(f"[2] Face detection: {t_face * 1000:.1f} ms  ({len(faces)} faces found)")
+
+    if not faces:
+        print("\nNo faces detected. Saving edge-detected background only.")
+        cv2.imwrite("test_output.png", bg)
+        print("Saved: test_output.png")
+        return
+
+    # 3. QPIXL processing
+    proc = QPIXLProcessor(args.compression, verbose=True)
+    output = bg.copy()
+
+    for i, face in enumerate(faces):
+        fid = i + 1
+        x, y, w, h = face["coords"]
+        color = FACE_COLORS[i % len(FACE_COLORS)]
+        cv2.rectangle(output, (x, y), (x + w, y + h), color, 2)
+
+        t0 = time.time()
+        padded, shape = proc.prepare(face["region"])
+        decoded = proc.process(padded, fid)
+        gray_face = proc.reconstruct(decoded, shape)
+        t_qpixl = time.time() - t0
+        print(f"[3] QPIXL face {fid}: {t_qpixl * 1000:.1f} ms")
+
+        proc_bgr = cv2.cvtColor(gray_face, cv2.COLOR_GRAY2BGR)
+        target = output[y : y + h, x : x + w]
+        resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]))
+        if resized.shape == target.shape:
+            output[y : y + h, x : x + w] = resized
+
+        # Draw panel
+        scale = output.shape[0] / 1080.0
+        ops = proc.tracker.get(fid)
+        _draw_panel(output, fid, face["coords"], ops, scale)
+
+    _draw_title(output, output.shape[0] / 1080.0)
+    _draw_face_count(output, len(faces), output.shape[0] / 1080.0)
+
+    cv2.imwrite("test_output.png", output)
+    print(f"\nSaved: test_output.png ({output.shape[1]}x{output.shape[0]})")
+    print("Pipeline test complete.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(description="Reality is Not What It Seems — QPIXL installation")
+    p.add_argument("--bg", choices=["edges-black", "edges-white", "passthrough"],
+                    default="edges-black", help="Background mode (default: edges-black)")
+    p.add_argument("--resolution", type=int, nargs=2, default=[3840, 2160],
+                    metavar=("W", "H"), help="Display resolution (default: 3840 2160)")
+    p.add_argument("--compression", type=int, default=40,
+                    help="QPIXL compression 0-100 (default: 40)")
+    p.add_argument("--verbose", action="store_true", help="Print FPS and debug info")
+    p.add_argument("--fullscreen", action="store_true", help="Start in fullscreen")
+    p.add_argument("--test", action="store_true", help="Run static pipeline test (no camera)")
+    p.add_argument("--test-image", type=str, default=None,
+                    help="Image file for --test mode (optional)")
+    args = p.parse_args()
+
+    if args.test:
+        run_test(args)
+    else:
+        print("Initializing QPIXL Installation...")
+        processor = InstallationProcessor(args)
+        processor.run()
 
 
 if __name__ == "__main__":
-    # Installation configuration
-    compression_level = 40  # Balanced compression for performance
-    display_resolution = (3840, 2160)  # 4K resolution
-    verbose_mode = False  # Set to True for debug output
-    
-    print("Initializing QPIXL Installation...")
-    processor = InstallationProcessor(
-        compression=compression_level, 
-        target_resolution=display_resolution,
-        verbose=verbose_mode
-    )
-    processor.run(verbose=verbose_mode)
+    main()

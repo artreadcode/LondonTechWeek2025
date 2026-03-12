@@ -1,4 +1,4 @@
-import helper as hlp
+from . import helper as hlp
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import partial_trace
