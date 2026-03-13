@@ -9,6 +9,8 @@ compression, and displays the result with edge-detected artistic backgrounds.
 
 Usage:
     python reality.py                          # Default: 4K, edges-black
+    python reality.py --lite                   # Lightweight mode for low-spec hardware
+    python reality.py --lite --fullscreen      # Lite + fullscreen
     python reality.py --bg edges-white         # White background with dark edges
     python reality.py --bg passthrough         # No edge detection, raw camera bg
     python reality.py --resolution 1920 1080   # Custom display resolution
@@ -154,19 +156,18 @@ class EdgeDetector:
 # Face detector (runs on downscaled frame for speed)
 # ---------------------------------------------------------------------------
 class FaceDetector:
-    DETECT_WIDTH = 640  # Run Haar cascade at this width
-
-    def __init__(self, min_face=(60, 60)):
+    def __init__(self, min_face=(60, 60), detect_width=640):
         self._cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
         self._min_face = min_face
+        self._detect_width = detect_width
 
     def detect(self, frame):
         """Detect faces on a downscaled copy; return coords in original frame space."""
         h, w = frame.shape[:2]
-        scale = self.DETECT_WIDTH / w
-        small = cv2.resize(frame, (self.DETECT_WIDTH, int(h * scale)))
+        scale = self._detect_width / w
+        small = cv2.resize(frame, (self._detect_width, int(h * scale)))
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
 
         faces = self._cascade.detectMultiScale(
@@ -206,16 +207,19 @@ class FaceDetector:
 # QPIXL quantum face processor
 # ---------------------------------------------------------------------------
 class QPIXLProcessor:
-    def __init__(self, compression=40, verbose=False):
+    def __init__(self, compression=40, verbose=False, face_size=32, lite=False):
         self.compression = compression
         self.verbose = verbose
+        self.face_size = face_size
+        self.lite = lite
         self.backend = Aer.get_backend("statevector_simulator")
         self.tracker = QuantumOperationTracker()
 
     def prepare(self, face_bgr):
         """Convert face ROI to padded 1-D array for QPIXL."""
+        sz = self.face_size
         gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY) if face_bgr.ndim == 3 else face_bgr.copy()
-        resized = cv2.resize(gray, (32, 32)).astype(np.float64)
+        resized = cv2.resize(gray, (sz, sz)).astype(np.float64)
         resized = np.clip(resized, 0, 255)
 
         # Guard against degenerate images
@@ -227,7 +231,7 @@ class QPIXLProcessor:
         # Normalise to [1, 254]
         resized = 1 + (resized - lo) * 253 / (hi - lo)
         flat = resized.astype(np.uint8).flatten().astype(np.float64)
-        return hlp.pad_0(flat), (32, 32)
+        return hlp.pad_0(flat), (sz, sz)
 
     def process(self, padded, face_id=1):
         """Run QPIXL encoding → simulation → decode. Returns 1-D pixel array."""
@@ -248,27 +252,41 @@ class QPIXLProcessor:
             return self._fallback(padded)
 
     def _run_circuit(self, circuit, face_id):
-        """Try multiple execution strategies."""
-        # Strategy 1: transpile + run
+        """Try multiple execution strategies. Lite mode uses Statevector directly."""
+        if self.lite:
+            # Skip transpile + Aer overhead entirely
+            try:
+                return Statevector.from_instruction(circuit)
+            except Exception:
+                pass
+            try:
+                return self.backend.run(circuit).result().get_statevector()
+            except Exception:
+                pass
+            tc = transpile(circuit, self.backend, optimization_level=0)
+            return self.backend.run(tc).result().get_statevector()
+
+        # Normal mode: transpile + run first
         try:
             tc = transpile(circuit, self.backend, optimization_level=0)
             return self.backend.run(tc).result().get_statevector()
         except Exception:
             pass
-        # Strategy 2: direct run
         try:
             return self.backend.run(circuit).result().get_statevector()
         except Exception:
             pass
-        # Strategy 3: Statevector.from_instruction
         return Statevector.from_instruction(circuit)
 
     def _fallback(self, padded):
-        arr = np.asarray(padded[:1024], dtype=np.float64)
+        n = self.face_size * self.face_size
+        arr = np.asarray(padded[:n], dtype=np.float64)
         return np.clip(arr * 0.8 + np.random.normal(0, 10, arr.shape), 0, 255)
 
-    def reconstruct(self, decoded, shape=(32, 32)):
+    def reconstruct(self, decoded, shape=None):
         """Decoded 1-D → 2-D uint8 image."""
+        if shape is None:
+            shape = (self.face_size, self.face_size)
         n = shape[0] * shape[1]
         if len(decoded) > n:
             decoded = decoded[:n]
@@ -414,27 +432,41 @@ class InstallationProcessor:
         self.verbose = args.verbose
         self.start_fullscreen = args.fullscreen
         self.show_panels = True
+        self.lite = getattr(args, "lite", False)
 
-        self.face_detector = FaceDetector()
-        self.qpixl = QPIXLProcessor(self.compression, self.verbose)
-        self.edge_detector = EdgeDetector()
+        if self.lite:
+            self.face_detector = FaceDetector(detect_width=320)
+            self.qpixl = QPIXLProcessor(self.compression, self.verbose,
+                                         face_size=16, lite=True)
+            self.edge_detector = EdgeDetector(cache_interval=0.5)
+            self._cache_timeout = 5.0
+            self._cam_width = 640
+            self._cam_height = 480
+        else:
+            self.face_detector = FaceDetector()
+            self.qpixl = QPIXLProcessor(self.compression, self.verbose)
+            self.edge_detector = EdgeDetector()
+            self._cache_timeout = 2.0
+            self._cam_width = 1920
+            self._cam_height = 1080
 
         self._latest_input = LatestFrame()
         self._latest_output = LatestFrame()
         self._running = False
 
         self._face_cache = {}
-        self._cache_timeout = 2.0
         self._stats_lock = threading.Lock()
         self._success = 0
         self._errors = 0
+        self._last_faces = []
+        self._frame_count = 0
 
     # --- threads -----------------------------------------------------------
 
     def _camera_thread(self):
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cam_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cam_height)
         cap.set(cv2.CAP_PROP_FPS, 30)
         if self.verbose:
             w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -463,8 +495,13 @@ class InstallationProcessor:
             # 1. Edge detection at native camera resolution
             background = self.edge_detector.process(frame, self.bg_mode)
 
-            # 2. Face detection on downscaled copy
-            faces = self.face_detector.detect(frame)
+            # 2. Face detection on downscaled copy (lite: skip every other frame)
+            self._frame_count += 1
+            if self.lite and self._frame_count % 2 == 0 and self._last_faces:
+                faces = self._last_faces
+            else:
+                faces = self.face_detector.detect(frame)
+                self._last_faces = faces
 
             # 3. Compose output at native resolution
             output = background  # already a copy from EdgeDetector
@@ -560,6 +597,13 @@ class InstallationProcessor:
     # --- main loop ---------------------------------------------------------
 
     def run(self):
+        if self.lite:
+            print("=" * 50)
+            print("LITE MODE — optimised for low-spec hardware")
+            print(f"  Face: {self.qpixl.face_size}x{self.qpixl.face_size}  "
+                  f"Camera: {self._cam_width}x{self._cam_height}  "
+                  f"Compression: {self.compression}%")
+            print("=" * 50)
         if self.verbose:
             print("=" * 50)
             print("Reality is Not What It Seems")
@@ -656,7 +700,11 @@ def run_test(args):
         return
 
     # 3. QPIXL processing
-    proc = QPIXLProcessor(args.compression, verbose=True)
+    lite = getattr(args, "lite", False)
+    face_size = 16 if lite else 32
+    proc = QPIXLProcessor(args.compression, verbose=True, face_size=face_size, lite=lite)
+    if lite:
+        print(f"  [LITE] Face size: {face_size}x{face_size}")
     output = bg.copy()
 
     for i, face in enumerate(faces):
@@ -698,16 +746,30 @@ def main():
     p = argparse.ArgumentParser(description="Reality is Not What It Seems — QPIXL installation")
     p.add_argument("--bg", choices=["edges-black", "edges-white", "passthrough"],
                     default="edges-black", help="Background mode (default: edges-black)")
-    p.add_argument("--resolution", type=int, nargs=2, default=[3840, 2160],
-                    metavar=("W", "H"), help="Display resolution (default: 3840 2160)")
-    p.add_argument("--compression", type=int, default=40,
-                    help="QPIXL compression 0-100 (default: 40)")
+    p.add_argument("--resolution", type=int, nargs=2, default=None,
+                    metavar=("W", "H"), help="Display resolution (default: 3840x2160, lite: 1280x720)")
+    p.add_argument("--compression", type=int, default=None,
+                    help="QPIXL compression 0-100 (default: 40, lite: 70)")
     p.add_argument("--verbose", action="store_true", help="Print FPS and debug info")
     p.add_argument("--fullscreen", action="store_true", help="Start in fullscreen")
     p.add_argument("--test", action="store_true", help="Run static pipeline test (no camera)")
     p.add_argument("--test-image", type=str, default=None,
                     help="Image file for --test mode (optional)")
+    p.add_argument("--lite", action="store_true",
+                    help="Lightweight mode for low-spec hardware (16x16 faces, 720p, lower camera res)")
     args = p.parse_args()
+
+    # Apply lite defaults (user-specified values take priority)
+    if args.lite:
+        if args.resolution is None:
+            args.resolution = [1280, 720]
+        if args.compression is None:
+            args.compression = 70
+    else:
+        if args.resolution is None:
+            args.resolution = [3840, 2160]
+        if args.compression is None:
+            args.compression = 40
 
     if args.test:
         run_test(args)
