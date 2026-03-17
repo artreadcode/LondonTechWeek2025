@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import cv2; print\\(''opencv:'', cv2.__version__\\)\")"
+    ]
+  }
+}
