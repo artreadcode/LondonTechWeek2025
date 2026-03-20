@@ -204,6 +204,83 @@ class FaceDetector:
 
 
 # ---------------------------------------------------------------------------
+# Face tracker (stable IDs across frames via spatial proximity matching)
+# ---------------------------------------------------------------------------
+class FaceTracker:
+    """Assign stable IDs to detected faces using nearest-neighbor matching.
+    IDs are recycled from a small pool (1..max_faces) so numbers stay low."""
+
+    def __init__(self, max_distance=150, expire_time=5.0, max_faces=6):
+        self._tracks = {}   # id -> {"center": (cx, cy), "time": t}
+        self._max_dist = max_distance
+        self._expire = expire_time
+        self._pool = list(range(max_faces, 0, -1))  # [6,5,4,3,2,1] — pop() gives lowest
+
+    def _alloc_id(self):
+        if self._pool:
+            return self._pool.pop()  # lowest available
+        # fallback: pick first int not in tracks
+        i = 1
+        while i in self._tracks:
+            i += 1
+        return i
+
+    def update(self, faces):
+        """Match detected faces to existing tracks. Returns faces with stable 'id' key."""
+        now = time.time()
+
+        # Expire old tracks, recycle their IDs
+        expired = [tid for tid, t in self._tracks.items()
+                   if now - t["time"] > self._expire]
+        for tid in expired:
+            del self._tracks[tid]
+            if tid not in self._pool:
+                self._pool.append(tid)
+        self._pool.sort(reverse=True)  # keep pop() giving lowest
+
+        if not faces:
+            return []
+
+        # Compute centres
+        centres = []
+        for face in faces:
+            x, y, w, h = face["coords"]
+            centres.append((x + w // 2, y + h // 2))
+
+        # Build (distance, face_index, track_id) pairs
+        pairs = []
+        for fi, (cx, cy) in enumerate(centres):
+            for tid, track in self._tracks.items():
+                tcx, tcy = track["center"]
+                dist = ((cx - tcx) ** 2 + (cy - tcy) ** 2) ** 0.5
+                if dist < self._max_dist:
+                    pairs.append((dist, fi, tid))
+        pairs.sort()
+
+        # Greedy assignment
+        assigned = {}
+        used_tracks = set()
+        for _, fi, tid in pairs:
+            if fi in assigned or tid in used_tracks:
+                continue
+            assigned[fi] = tid
+            used_tracks.add(tid)
+
+        # Allocate recycled IDs for unmatched faces
+        for fi in range(len(faces)):
+            if fi not in assigned:
+                assigned[fi] = self._alloc_id()
+
+        # Update tracks and build result
+        result = []
+        for fi, face in enumerate(faces):
+            tid = assigned[fi]
+            self._tracks[tid] = {"center": centres[fi], "time": now}
+            result.append({"region": face["region"], "coords": face["coords"], "id": tid})
+        return result
+
+
+# ---------------------------------------------------------------------------
 # QPIXL quantum face processor
 # ---------------------------------------------------------------------------
 class QPIXLProcessor:
@@ -435,7 +512,7 @@ class InstallationProcessor:
         self.lite = getattr(args, "lite", False)
 
         if self.lite:
-            self.face_detector = FaceDetector(detect_width=320)
+            self.face_detector = FaceDetector(detect_width=320, min_face=(30, 30))
             self.qpixl = QPIXLProcessor(self.compression, self.verbose,
                                          face_size=16, lite=True)
             self.edge_detector = EdgeDetector(cache_interval=0.5)
@@ -450,6 +527,7 @@ class InstallationProcessor:
             self._cam_width = 1920
             self._cam_height = 1080
 
+        self.face_tracker = FaceTracker()
         self._latest_input = LatestFrame()
         self._latest_output = LatestFrame()
         self._running = False
@@ -458,27 +536,48 @@ class InstallationProcessor:
         self._stats_lock = threading.Lock()
         self._success = 0
         self._errors = 0
-        self._last_faces = []
+        self._last_tracked = []
         self._frame_count = 0
 
     # --- threads -----------------------------------------------------------
 
     def _camera_thread(self):
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cam_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cam_height)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        if self.verbose:
-            w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-            h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-            print(f"Camera: {w:.0f}x{h:.0f}")
+        cap = None
+        fail_count = 0
+        max_consecutive_fails = 30
 
         while self._running:
+            # (Re-)open camera if needed
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = cv2.VideoCapture(0)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cam_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cam_height)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                fail_count = 0
+                if self.verbose:
+                    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    print(f"Camera opened: {w:.0f}x{h:.0f}")
+
             ret, frame = cap.read()
             if ret:
                 self._latest_input.put(frame)
-            # No sleep — cap.read() already blocks at camera FPS
-        cap.release()
+                fail_count = 0
+            else:
+                fail_count += 1
+                if fail_count >= max_consecutive_fails:
+                    if self.verbose:
+                        print("Camera: too many read failures, reopening...")
+                    cap.release()
+                    cap = None
+                    time.sleep(1.0)
+                else:
+                    time.sleep(0.03)  # avoid tight loop on transient failure
+
+        if cap is not None:
+            cap.release()
 
     def _processing_thread(self):
         fps_time = time.time()
@@ -497,11 +596,17 @@ class InstallationProcessor:
 
             # 2. Face detection on downscaled copy (lite: skip every other frame)
             self._frame_count += 1
-            if self.lite and self._frame_count % 2 == 0 and self._last_faces:
-                faces = self._last_faces
+            if self.lite and self._frame_count % 2 == 0 and self._last_tracked:
+                tracked = self._last_tracked
+                # Re-extract regions from current frame
+                for t in tracked:
+                    x, y, w, h = t["coords"]
+                    if y + h <= frame.shape[0] and x + w <= frame.shape[1]:
+                        t["region"] = frame[y:y+h, x:x+w]
             else:
-                faces = self.face_detector.detect(frame)
-                self._last_faces = faces
+                raw_faces = self.face_detector.detect(frame)
+                tracked = self.face_tracker.update(raw_faces)
+                self._last_tracked = tracked
 
             # 3. Compose output at native resolution
             output = background  # already a copy from EdgeDetector
@@ -509,21 +614,26 @@ class InstallationProcessor:
             now = time.time()
             active_ids = set()
 
-            for i, face in enumerate(faces):
-                fid = i + 1
+            for face in tracked:
+                fid = face["id"]
                 active_ids.add(fid)
                 try:
                     region = face["region"]
                     x, y, w, h = face["coords"]
-                    color = FACE_COLORS[i % len(FACE_COLORS)]
+                    color = FACE_COLORS[fid % len(FACE_COLORS)]
 
                     # Face outline
                     cv2.rectangle(output, (x, y), (x + w, y + h), color, max(2, w // 40))
 
-                    # Cache lookup
-                    ckey = f"{x // 30}_{y // 30}_{w // 30}"
+                    # Cache lookup — invalidate on timeout OR significant movement
+                    ckey = str(fid)
                     cached = self._face_cache.get(ckey)
+                    cache_hit = False
                     if cached and now - cached["time"] < self._cache_timeout:
+                        ox, oy = cached.get("pos", (x, y))
+                        if abs(x - ox) < 40 and abs(y - oy) < 40:
+                            cache_hit = True
+                    if cache_hit:
                         proc_bgr = cached["img"]
                     else:
                         padded, shape = self.qpixl.prepare(region)
@@ -539,7 +649,7 @@ class InstallationProcessor:
                         hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.1, 0, 255).astype(np.uint8)
                         proc_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-                        self._face_cache[ckey] = {"img": proc_bgr, "time": now}
+                        self._face_cache[ckey] = {"img": proc_bgr, "time": now, "pos": (x, y)}
                         with self._stats_lock:
                             self._success += 1
 
@@ -564,13 +674,13 @@ class InstallationProcessor:
 
             # Draw panels
             if self.show_panels:
-                for i, face in enumerate(faces):
-                    fid = i + 1
+                for face in tracked:
+                    fid = face["id"]
                     ops = self.qpixl.tracker.get(fid)
                     _draw_panel(output, fid, face["coords"], ops, scale)
 
             _draw_title(output, scale)
-            _draw_face_count(output, len(faces), scale)
+            _draw_face_count(output, len(tracked), scale)
 
             # 4. Upscale to display resolution ONCE
             if (output.shape[1], output.shape[0]) != self.display_res:
@@ -584,7 +694,7 @@ class InstallationProcessor:
             if self.verbose and elapsed >= 2.0:
                 print(f"Processing FPS: {fps_count / elapsed:.1f}  "
                       f"Frame time: {(time.time() - t0) * 1000:.0f}ms  "
-                      f"Faces: {len(faces)}")
+                      f"Faces: {len(tracked)}")
                 fps_count = 0
                 fps_time = time.time()
 
@@ -625,11 +735,14 @@ class InstallationProcessor:
         if self.start_fullscreen:
             cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+        last_display = None
         try:
             while self._running:
                 output = self._latest_output.get()
                 if output is not None:
-                    cv2.imshow(WINDOW_NAME, output)
+                    last_display = output
+                if last_display is not None:
+                    cv2.imshow(WINDOW_NAME, last_display)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
