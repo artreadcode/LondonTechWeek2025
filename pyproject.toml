@@ -1,0 +1,14 @@
+[project]
+name = "reality-is-not-what-it-seems"
+version = "1.0.0"
+description = "Live QPIXL art installation: faces seen through a quantum image encoding"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "numpy==2.4.4",
+    "opencv-python==4.11.0.86",  # window code relies on the 4.11 Cocoa backend
+    "pyobjc-core==12.1",
+    "pyobjc-framework-Cocoa==12.1",
+    "qiskit==2.5.2",
+    "qiskit-aer==0.17.2",
+]

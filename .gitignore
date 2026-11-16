@@ -5,3 +5,5 @@ __pycache__/*
 .DS_Store
 dummy/.DS_Store
 *.pyc
+.venv
+test_output.png

@@ -2,13 +2,13 @@
 
 A live art installation for **London Tech Week 2025** (9–11 June, Olympia London), in collaboration with UAL Creative Computing Institute.
 
-Visitors stand in front of a camera. Their faces are detected, encoded through a real quantum image compression algorithm (QPIXL), and displayed back — pixelated, colour-shifted, seen through the lens of quantum information. A panel beside each face shows the actual quantum gate parameters that encoded *their specific face* into a quantum state.
+Visitors stand in front of a camera. Their faces are detected, encoded through a real quantum image compression algorithm (QPIXL), and displayed back — pixelated, greyscale, seen through the lens of quantum information. A panel beside each face shows the actual quantum gate parameters that encoded *their specific face* into a quantum state.
 
 The pixelation isn't a glitch. It's what a quantum computer would "see" if it stored your face.
 
 ## How It Works
 
-The installation runs a live pipeline from camera to 4K display:
+The installation runs a live pipeline from camera to display:
 
 ### 1. Capture & Detect
 A webcam captures the scene. OpenCV's Haar cascade detects faces on a downscaled frame for speed, then coordinates are mapped back to full resolution.
@@ -16,7 +16,7 @@ A webcam captures the scene. OpenCV's Haar cascade detects faces on a downscaled
 ### 2. Quantum Encoding (QPIXL)
 Each detected face is resized to 32×32 grayscale and encoded using **QPIXL** — a quantum image compression algorithm based on [this Nature paper](https://www.nature.com/articles/s41598-022-11024-y) (compressed FRQI). The steps:
 
-1. **Pixel → angle**: Each pixel brightness (0–254) maps to a rotation angle (0 to π/2)
+1. **Pixel → angle**: Each pixel brightness (rescaled to 1–254) maps to a rotation angle (up to π/2)
 2. **Walsh-Hadamard Transform**: Transforms pixel angles into frequency-domain coefficients (similar to how JPEG uses DCT). Natural images concentrate energy in low frequencies, so many coefficients are near zero
 3. **Compression**: The smallest 95% of coefficients are zeroed out — fewer non-zero coefficients means fewer quantum gates
 4. **Gray code reordering**: Consecutive pixel addresses differ by only 1 bit, minimising CNOT gates needed
@@ -25,27 +25,39 @@ Each detected face is resized to 32×32 grayscale and encoded using **QPIXL** �
 For a 32×32 face at 95% compression, this produces an 11-qubit circuit with 52 RY gates at depth ~170.
 
 ### 3. Simulate & Decode
-The circuit runs on Qiskit Aer's statevector simulator, producing 2048 complex amplitudes. The decoder extracts pixel angles from amplitude pairs via `arctan2` and scales them back to grayscale values.
+The circuit runs on Qiskit Aer's statevector simulator, producing 2048 complex amplitudes. The decoder takes the 2048 probabilities, applies `arctan2` to each pair and rescales the result to 0–255.
 
 ### 4. Display
-The quantum-reconstructed face (with artistic hue shift) is stamped onto an edge-detected background. A HUD panel next to each face shows the live quantum circuit parameters — the actual `ry(angle, q0)` rotation gates that encoded that person's face.
+The quantum-reconstructed greyscale face is stamped onto an edge-detected background. A HUD panel next to each face shows the live quantum circuit parameters — the actual `ry(angle, q0)` rotation gates that encoded that person's face.
+
+## Install
+
+Needs macOS on Apple Silicon and [uv](https://docs.astral.sh/uv/). uv installs Python 3.12 and the pinned packages.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+git clone https://github.com/artreadcode/LondonTechWeek2025.git
+cd LondonTechWeek2025
+uv sync --locked
+```
+
+Without uv: `pip install -r requirements.txt` in a Python 3.12 environment, then use `python` in place of `uv run --locked`.
 
 ## Running
 
-Requires conda base Python (dependencies are installed in miniconda3):
-
 ```bash
-# Exhibition mode (fullscreen)
-python reality.py --fullscreen
-
-# Development (windowed, debug info)
-python reality.py --verbose
-
 # Static pipeline test (no camera needed)
-python reality.py --test
+uv run --locked reality.py --test
+
+# Find the camera: prints the opened index and resolution
+uv run --locked reality.py --camera 0 --verbose
+
+# Exhibition mode (fullscreen, no sleep)
+caffeinate -di uv run --locked reality.py --camera 0 --fullscreen
 
 # Test with a specific image
-python reality.py --test --test-image photo.jpg
+uv run --locked reality.py --test --test-image photo.jpg
 ```
 
 ### Options
@@ -55,9 +67,10 @@ python reality.py --test --test-image photo.jpg
 | `--bg edges-white` | White background with dark edges (default) |
 | `--bg edges-black` | Black background with white edges |
 | `--bg passthrough` | Raw camera feed as background |
-| `--compression N` | QPIXL compression 0–100 (default: 95) |
+| `--compression N` | QPIXL compression 0–100 (default: 95, lite: 70) |
 | `--camera N` | Camera index (default: 0) |
 | `--fullscreen` | Start in fullscreen |
+| `--lite` | Lightweight mode: 16×16 faces, 640×480 camera |
 | `--verbose` | Print FPS and timing info |
 
 ### Controls
@@ -72,11 +85,17 @@ python reality.py --test --test-image photo.jpg
 
 ## Dependencies
 
-- Python 3.12 (conda base)
-- opencv-python
-- numpy
-- qiskit 2.0
-- qiskit-aer
+Pinned in `pyproject.toml`, locked in `uv.lock`, exported to `requirements.txt`:
+
+- Python 3.12
+- opencv-python 4.11.0.86 (the window code relies on its Cocoa backend)
+- numpy 2.4.4
+- qiskit 2.5.2
+- qiskit-aer 0.17.2
+- pyobjc-core 12.1
+- pyobjc-framework-Cocoa 12.1
+
+After changing a dependency: `uv lock`, then `uv export --format requirements.txt --no-hashes --no-emit-project --locked -o requirements.txt`.
 
 ## Project Structure
 
