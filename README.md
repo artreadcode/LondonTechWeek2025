@@ -81,7 +81,5 @@ python reality.py --test --test-image photo.jpg
 ## Project Structure
 
 - **`reality.py`** — Main installation application
-- **`qpixl.py`** — QPIXL algorithm: builds compressed FRQI quantum circuits from image data
-- **`helper.py`** — Support functions: Walsh-Hadamard transform, Gray code, angle conversion, statevector decoding, image reconstruction
-- **`qpixl_angs.py`** — Variant QPIXL with angle-based encoding (not used by the installation)
-- **`dummy/`** — (Suspended) Alternative approach using OSC to send face coordinates to TouchDesigner
+- **`lib/qpixl.py`** — QPIXL algorithm: builds compressed FRQI quantum circuits from image data
+- **`lib/helper.py`** — Support functions: Walsh-Hadamard transform, Gray code, angle conversion, statevector decoding, image reconstruction
