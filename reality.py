@@ -17,6 +17,7 @@ Usage:
     python reality.py --fullscreen             # Start in fullscreen
     python reality.py --test                   # Static test mode (no camera)
     python reality.py --verbose                # Print FPS and timing info
+    python reality.py --camera 1               # Use camera index 1
 """
 
 import argparse
@@ -35,9 +36,6 @@ from qiskit.quantum_info import Statevector
 WINDOW_NAME = "Reality?"
 
 
-# ---------------------------------------------------------------------------
-# Latest-frame holder (replaces Queue — always keep only the newest frame)
-# ---------------------------------------------------------------------------
 class LatestFrame:
     """Thread-safe single-slot frame holder. Writers always overwrite; readers
     always get the most recent frame (or None)."""
@@ -57,9 +55,6 @@ class LatestFrame:
             return frame
 
 
-# ---------------------------------------------------------------------------
-# Quantum operation tracker (per-face, bounded)
-# ---------------------------------------------------------------------------
 class QuantumOperationTracker:
     """Track quantum circuit parameters for HUD display, per face."""
 
@@ -96,7 +91,6 @@ class QuantumOperationTracker:
             depth = circuit.depth()
             self.add(face_id, f"Qubits: {n_qubits}  Depth: {depth}")
 
-            # Collect rotation gates grouped by qubit
             qubit_gates = {}
             for inst in circuit.data:
                 name = inst.operation.name.upper()
@@ -106,7 +100,6 @@ class QuantumOperationTracker:
                 qubit = circuit.find_bit(inst.qubits[0]).index
                 qubit_gates.setdefault(qubit, []).append((name, angle))
 
-            # Sort each qubit's gates by magnitude, take top ones
             entries = []
             for q, gates in qubit_gates.items():
                 gates.sort(key=lambda g: abs(g[1]), reverse=True)
@@ -119,9 +112,6 @@ class QuantumOperationTracker:
             self.add(face_id, "Analysis Error")
 
 
-# ---------------------------------------------------------------------------
-# Edge detection (operates at native resolution, cached)
-# ---------------------------------------------------------------------------
 class EdgeDetector:
     def __init__(self, cache_interval=0.1):
         self._cache = None
@@ -152,11 +142,8 @@ class EdgeDetector:
         return result.copy()
 
 
-# ---------------------------------------------------------------------------
-# Face detector (runs on downscaled frame for speed)
-# ---------------------------------------------------------------------------
 class FaceDetector:
-    def __init__(self, min_face=(60, 60), detect_width=640):
+    def __init__(self, min_face=(30, 30), detect_width=640):
         self._cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
@@ -181,19 +168,16 @@ class FaceDetector:
         results = []
         inv_scale = 1.0 / scale
         for fx, fy, fw, fh in faces:
-            # Scale back to original resolution
             ox = int(fx * inv_scale)
             oy = int(fy * inv_scale)
             ow = int(fw * inv_scale)
             oh = int(fh * inv_scale)
 
-            # Make square
             size = max(ow, oh)
             cx, cy = ox + ow // 2, oy + oh // 2
             nx = max(0, cx - size // 2)
             ny = max(0, cy - size // 2)
 
-            # Bounds check
             if nx + size > w or ny + size > h:
                 continue
             region = frame[ny : ny + size, nx : nx + size]
@@ -203,9 +187,6 @@ class FaceDetector:
         return results
 
 
-# ---------------------------------------------------------------------------
-# Face tracker (stable IDs across frames via spatial proximity matching)
-# ---------------------------------------------------------------------------
 class FaceTracker:
     """Assign stable IDs to detected faces using nearest-neighbor matching.
     IDs are recycled from a small pool (1..max_faces) so numbers stay low."""
@@ -218,8 +199,7 @@ class FaceTracker:
 
     def _alloc_id(self):
         if self._pool:
-            return self._pool.pop()  # lowest available
-        # fallback: pick first int not in tracks
+            return self._pool.pop()
         i = 1
         while i in self._tracks:
             i += 1
@@ -229,7 +209,6 @@ class FaceTracker:
         """Match detected faces to existing tracks. Returns faces with stable 'id' key."""
         now = time.time()
 
-        # Expire old tracks, recycle their IDs
         expired = [tid for tid, t in self._tracks.items()
                    if now - t["time"] > self._expire]
         for tid in expired:
@@ -241,13 +220,11 @@ class FaceTracker:
         if not faces:
             return []
 
-        # Compute centres
         centres = []
         for face in faces:
             x, y, w, h = face["coords"]
             centres.append((x + w // 2, y + h // 2))
 
-        # Build (distance, face_index, track_id) pairs
         pairs = []
         for fi, (cx, cy) in enumerate(centres):
             for tid, track in self._tracks.items():
@@ -257,7 +234,6 @@ class FaceTracker:
                     pairs.append((dist, fi, tid))
         pairs.sort()
 
-        # Greedy assignment
         assigned = {}
         used_tracks = set()
         for _, fi, tid in pairs:
@@ -266,12 +242,10 @@ class FaceTracker:
             assigned[fi] = tid
             used_tracks.add(tid)
 
-        # Allocate recycled IDs for unmatched faces
         for fi in range(len(faces)):
             if fi not in assigned:
                 assigned[fi] = self._alloc_id()
 
-        # Update tracks and build result
         result = []
         for fi, face in enumerate(faces):
             tid = assigned[fi]
@@ -280,9 +254,6 @@ class FaceTracker:
         return result
 
 
-# ---------------------------------------------------------------------------
-# QPIXL quantum face processor
-# ---------------------------------------------------------------------------
 class QPIXLProcessor:
     def __init__(self, compression=40, verbose=False, face_size=32, lite=False):
         self.compression = compression
@@ -305,7 +276,6 @@ class QPIXLProcessor:
             resized += np.random.uniform(-2, 2, resized.shape)
             resized = np.clip(resized, 1, 254)
             lo, hi = resized.min(), resized.max()
-        # Normalise to [1, 254]
         resized = 1 + (resized - lo) * 253 / (hi - lo)
         flat = resized.astype(np.uint8).flatten().astype(np.float64)
         return hlp.pad_0(flat), (sz, sz)
@@ -343,7 +313,6 @@ class QPIXLProcessor:
             tc = transpile(circuit, self.backend, optimization_level=0)
             return self.backend.run(tc).result().get_statevector()
 
-        # Normal mode: transpile + run first
         try:
             tc = transpile(circuit, self.backend, optimization_level=0)
             return self.backend.run(tc).result().get_statevector()
@@ -373,9 +342,6 @@ class QPIXLProcessor:
         return np.clip(img, 0, 255).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# HUD / overlay drawing
-# ---------------------------------------------------------------------------
 FACE_COLORS = [
     (0, 255, 255),
     (255, 0, 255),
@@ -391,7 +357,6 @@ def _draw_panel(frame, face_id, coords, ops, scale):
     x, y, w, h = coords
     color = FACE_COLORS[face_id % len(FACE_COLORS)]
 
-    # Panel dimensions scaled to frame size
     pw = int(400 * scale)
     ph = int(300 * scale)
 
@@ -405,7 +370,6 @@ def _draw_panel(frame, face_id, coords, ops, scale):
         px = max(gap, x - pw - gap)
     py = max(gap, min(y, fheight - ph - gap))
 
-    # Clamp to frame bounds
     px2 = min(px + pw, fwidth)
     py2 = min(py + ph, fheight)
     if px2 - px < 50 or py2 - py < 50:
@@ -417,11 +381,9 @@ def _draw_panel(frame, face_id, coords, ops, scale):
     cv2.addWeighted(roi, 0.25, dark, 0.75, 0, roi)
     frame[py:py2, px:px2] = roi
 
-    # Border
     thickness = max(2, int(3 * scale))
     cv2.rectangle(frame, (px, py), (px2, py2), color, thickness)
 
-    # Title
     fs_title = 1.2 * scale
     fs_body = 0.8 * scale
     lh = int(30 * scale)
@@ -456,7 +418,6 @@ def _draw_panel(frame, face_id, coords, ops, scale):
                     cv2.FONT_HERSHEY_SIMPLEX, fs, c, max(1, int(2 * scale)))
         ty += lh
 
-    # Connection line from face centre to panel edge
     fcx, fcy = x + w // 2, y + h // 2
     pcx = px if px > x else px2
     pcy = py + int(50 * scale)
@@ -472,7 +433,6 @@ def _draw_title(frame, scale):
     (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
     tx = (fw - tw) // 2
     ty = int(70 * scale)
-    # Shadow
     cv2.putText(frame, title, (tx + 2, ty + 2),
                 cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2)
     cv2.putText(frame, title, (tx, ty),
@@ -498,9 +458,6 @@ def _draw_face_count(frame, count, scale):
                     cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), max(1, int(3 * scale)))
 
 
-# ---------------------------------------------------------------------------
-# Main installation processor
-# ---------------------------------------------------------------------------
 class InstallationProcessor:
     def __init__(self, args):
         self.bg_mode = args.bg
@@ -510,6 +467,7 @@ class InstallationProcessor:
         self.start_fullscreen = args.fullscreen
         self.show_panels = True
         self.lite = getattr(args, "lite", False)
+        self.camera = args.camera
 
         if self.lite:
             self.face_detector = FaceDetector(detect_width=320, min_face=(30, 30))
@@ -539,19 +497,16 @@ class InstallationProcessor:
         self._last_tracked = []
         self._frame_count = 0
 
-    # --- threads -----------------------------------------------------------
-
     def _camera_thread(self):
         cap = None
         fail_count = 0
         max_consecutive_fails = 30
 
         while self._running:
-            # (Re-)open camera if needed
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
-                cap = cv2.VideoCapture(0)
+                cap = cv2.VideoCapture(self.camera)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._cam_width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cam_height)
                 cap.set(cv2.CAP_PROP_FPS, 30)
@@ -559,7 +514,7 @@ class InstallationProcessor:
                 if self.verbose:
                     w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
                     h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                    print(f"Camera opened: {w:.0f}x{h:.0f}")
+                    print(f"Camera {self.camera} opened: {w:.0f}x{h:.0f}")
 
             ret, frame = cap.read()
             if ret:
@@ -598,7 +553,6 @@ class InstallationProcessor:
             self._frame_count += 1
             if self.lite and self._frame_count % 2 == 0 and self._last_tracked:
                 tracked = self._last_tracked
-                # Re-extract regions from current frame
                 for t in tracked:
                     x, y, w, h = t["coords"]
                     if y + h <= frame.shape[0] and x + w <= frame.shape[1]:
@@ -622,7 +576,6 @@ class InstallationProcessor:
                     x, y, w, h = face["coords"]
                     color = FACE_COLORS[fid % len(FACE_COLORS)]
 
-                    # Face outline
                     cv2.rectangle(output, (x, y), (x + w, y + h), color, max(2, w // 40))
 
                     # Cache lookup — invalidate on timeout OR significant movement
@@ -653,7 +606,6 @@ class InstallationProcessor:
                         with self._stats_lock:
                             self._success += 1
 
-                    # Stamp processed face into output
                     target = output[y : y + h, x : x + w]
                     resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]))
                     if resized.shape == target.shape:
@@ -665,14 +617,12 @@ class InstallationProcessor:
                     with self._stats_lock:
                         self._errors += 1
 
-            # Clean stale caches
             self._cleanup_cache(now)
             self.qpixl.tracker.clear_stale(active_ids)
 
             # HUD scale factor (relative to 1080p)
             scale = output.shape[0] / 1080.0
 
-            # Draw panels
             if self.show_panels:
                 for face in tracked:
                     fid = face["id"]
@@ -688,7 +638,6 @@ class InstallationProcessor:
 
             self._latest_output.put(output)
 
-            # FPS counter
             fps_count += 1
             elapsed = time.time() - fps_time
             if self.verbose and elapsed >= 2.0:
@@ -703,8 +652,6 @@ class InstallationProcessor:
                  if now - v["time"] > self._cache_timeout * 2]
         for k in stale:
             del self._face_cache[k]
-
-    # --- main loop ---------------------------------------------------------
 
     def run(self):
         if self.lite:
@@ -767,14 +714,10 @@ class InstallationProcessor:
             cv2.destroyAllWindows()
 
 
-# ---------------------------------------------------------------------------
-# Static test mode (no camera required)
-# ---------------------------------------------------------------------------
 def run_test(args):
     """Run the full pipeline on a static image or generated test pattern."""
     print("=== Static Pipeline Test ===\n")
 
-    # Load or generate test image
     if args.test_image:
         img = cv2.imread(args.test_image)
         if img is None:
@@ -782,24 +725,20 @@ def run_test(args):
             return
         print(f"Loaded: {args.test_image}  ({img.shape[1]}x{img.shape[0]})")
     else:
-        # Generate 640x480 test image with a synthetic "face-like" pattern
         img = np.zeros((480, 640, 3), dtype=np.uint8)
         img[:] = (80, 80, 80)
-        # Draw an ellipse as a rough face
         cv2.ellipse(img, (320, 240), (80, 100), 0, 0, 360, (200, 180, 160), -1)
         cv2.circle(img, (295, 220), 10, (50, 50, 50), -1)  # left eye
         cv2.circle(img, (345, 220), 10, (50, 50, 50), -1)  # right eye
         cv2.ellipse(img, (320, 270), (25, 10), 0, 0, 360, (100, 80, 80), -1)  # mouth
         print("Using generated test pattern (640x480)")
 
-    # 1. Edge detection
     edge_det = EdgeDetector()
     t0 = time.time()
     bg = edge_det.process(img, args.bg)
     t_edge = time.time() - t0
     print(f"[1] Edge detection ({args.bg}): {t_edge * 1000:.1f} ms")
 
-    # 2. Face detection
     face_det = FaceDetector()
     t0 = time.time()
     faces = face_det.detect(img)
@@ -812,7 +751,6 @@ def run_test(args):
         print("Saved: test_output.png")
         return
 
-    # 3. QPIXL processing
     lite = getattr(args, "lite", False)
     face_size = 16 if lite else 32
     proc = QPIXLProcessor(args.compression, verbose=True, face_size=face_size, lite=lite)
@@ -839,7 +777,6 @@ def run_test(args):
         if resized.shape == target.shape:
             output[y : y + h, x : x + w] = resized
 
-        # Draw panel
         scale = output.shape[0] / 1080.0
         ops = proc.tracker.get(fid)
         _draw_panel(output, fid, face["coords"], ops, scale)
@@ -852,9 +789,6 @@ def run_test(args):
     print("Pipeline test complete.")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="Reality is Not What It Seems — QPIXL installation")
     p.add_argument("--bg", choices=["edges-black", "edges-white", "passthrough"],
@@ -868,6 +802,7 @@ def main():
     p.add_argument("--test", action="store_true", help="Run static pipeline test (no camera)")
     p.add_argument("--test-image", type=str, default=None,
                     help="Image file for --test mode (optional)")
+    p.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
     p.add_argument("--lite", action="store_true",
                     help="Lightweight mode for low-spec hardware (16x16 faces, 720p, lower camera res)")
     args = p.parse_args()

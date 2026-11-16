@@ -57,6 +57,7 @@ python reality.py --test --test-image photo.jpg
 | `--bg passthrough` | Raw camera feed as background |
 | `--resolution W H` | Display resolution (default: 3840 2160) |
 | `--compression N` | QPIXL compression 0–100 (default: 40) |
+| `--camera N` | Camera index (default: 0) |
 | `--fullscreen` | Start in fullscreen |
 | `--verbose` | Print FPS and timing info |
 

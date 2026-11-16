@@ -25,6 +25,9 @@ Requires **conda base** Python (packages are in miniconda3, not brew Python):
 
 # Background modes: edges-black (default), edges-white, passthrough
 /Users/astrydpark/miniconda3/bin/python reality.py --bg edges-white
+
+# External camera (index printed with --verbose)
+/Users/astrydpark/miniconda3/bin/python reality.py --camera 1 --verbose
 ```
 
 Controls: `q` quit, `f` fullscreen toggle, `o` toggle quantum panels, `v` toggle verbose.
