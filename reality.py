@@ -30,9 +30,7 @@ import time
 import lib.helper as hlp
 import lib.qpixl as qpixl
 
-from qiskit import transpile
 from qiskit_aer import Aer
-from qiskit.quantum_info import Statevector
 
 WINDOW_NAME = "Reality?"
 
@@ -256,11 +254,10 @@ class FaceTracker:
 
 
 class QPIXLProcessor:
-    def __init__(self, compression=40, verbose=False, face_size=32, lite=False):
+    def __init__(self, compression=40, verbose=False, face_size=32):
         self.compression = compression
         self.verbose = verbose
         self.face_size = face_size
-        self.lite = lite
         self.backend = Aer.get_backend("statevector_simulator")
         self.tracker = QuantumOperationTracker()
 
@@ -291,39 +288,13 @@ class QPIXLProcessor:
             circuit = qpixl.cFRQI(padded, self.compression)
             self.tracker.analyze_circuit(circuit, face_id)
 
-            sv = self._run_circuit(circuit, face_id)
+            sv = self.backend.run(circuit).result().get_statevector()
             return hlp.decodeQPIXL(sv.probabilities(), min_pixel_val=0, max_pixel_val=255)
         except Exception as e:
             if self.verbose:
                 print(f"  QPIXL error face {face_id}: {e}")
             self.tracker.add(face_id, "QPIXL Error")
             return self._fallback(padded)
-
-    def _run_circuit(self, circuit, face_id):
-        """Try multiple execution strategies. Lite mode uses Statevector directly."""
-        if self.lite:
-            # Skip transpile + Aer overhead entirely
-            try:
-                return Statevector.from_instruction(circuit)
-            except Exception:
-                pass
-            try:
-                return self.backend.run(circuit).result().get_statevector()
-            except Exception:
-                pass
-            tc = transpile(circuit, self.backend, optimization_level=0)
-            return self.backend.run(tc).result().get_statevector()
-
-        try:
-            tc = transpile(circuit, self.backend, optimization_level=0)
-            return self.backend.run(tc).result().get_statevector()
-        except Exception:
-            pass
-        try:
-            return self.backend.run(circuit).result().get_statevector()
-        except Exception:
-            pass
-        return Statevector.from_instruction(circuit)
 
     def _fallback(self, padded):
         n = self.face_size * self.face_size
@@ -458,7 +429,7 @@ class InstallationProcessor:
         if self.lite:
             self.face_detector = FaceDetector(detect_width=320, min_face=(30, 30))
             self.qpixl = QPIXLProcessor(self.compression, self.verbose,
-                                         face_size=16, lite=True)
+                                         face_size=16)
             self.edge_detector = EdgeDetector(cache_interval=0.5)
             self._cache_timeout = 5.0
             self._cam_width = 640
@@ -746,7 +717,7 @@ def run_test(args):
 
     lite = getattr(args, "lite", False)
     face_size = 16 if lite else 32
-    proc = QPIXLProcessor(args.compression, verbose=True, face_size=face_size, lite=lite)
+    proc = QPIXLProcessor(args.compression, verbose=True, face_size=face_size)
     if lite:
         print(f"  [LITE] Face size: {face_size}x{face_size}")
     output = bg.copy()
