@@ -11,11 +11,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Requires **conda base** Python (packages are in miniconda3, not brew Python):
 
 ```bash
-# Main exhibition file (4K, fullscreen, edges-black background)
+# Main exhibition file (fullscreen, edges-white background)
 /Users/astrydpark/miniconda3/bin/python reality.py --fullscreen
 
 # Development / debug
-/Users/astrydpark/miniconda3/bin/python reality.py --verbose --resolution 1280 720
+/Users/astrydpark/miniconda3/bin/python reality.py --verbose
 
 # Static pipeline test (no camera needed)
 /Users/astrydpark/miniconda3/bin/python reality.py --test
@@ -23,14 +23,14 @@ Requires **conda base** Python (packages are in miniconda3, not brew Python):
 # Test with custom image
 /Users/astrydpark/miniconda3/bin/python reality.py --test --test-image photo.jpg
 
-# Background modes: edges-black (default), edges-white, passthrough
-/Users/astrydpark/miniconda3/bin/python reality.py --bg edges-white
+# Background modes: edges-white (default), edges-black, passthrough
+/Users/astrydpark/miniconda3/bin/python reality.py --bg edges-black
 
 # External camera (index printed with --verbose)
 /Users/astrydpark/miniconda3/bin/python reality.py --camera 1 --verbose
 ```
 
-Controls: `q` quit, `f` fullscreen toggle, `o` toggle quantum panels, `v` toggle verbose.
+Controls: `q` quit, `f` fullscreen toggle, `esc` leave fullscreen, `o` toggle quantum panels, `v` toggle verbose.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ Controls: `q` quit, `f` fullscreen toggle, `o` toggle quantum panels, `v` toggle
 - `InstallationProcessor` — Orchestrates camera thread, processing thread, display loop
 - `run_test()` — Static pipeline test mode (no camera)
 
-**Performance pipeline**: Camera native res → face detect on 640px downscale → edge detect at native → compose at native → single upscale to display res for imshow.
+**Performance pipeline**: Camera native res → face detect on 640px downscale → edge detect at native → compose at native → imshow; `_Picture` keeps it centred and aspect-fitted in the window on any display.
 
 **`qpixl.py`** — Core QPIXL algorithm. `cFRQI()` builds quantum circuit from image data using compressed FRQI encoding (based on [Nature paper](https://www.nature.com/articles/s41598-022-11024-y)). Do not modify.
 
@@ -55,7 +55,7 @@ Controls: `q` quit, `f` fullscreen toggle, `o` toggle quantum panels, `v` toggle
 
 ## Dependencies
 
-opencv-python, numpy, qiskit 2.0, qiskit-aer (all in conda base environment).
+opencv-python, numpy, qiskit 2.0, qiskit-aer, pyobjc (AppKit, macOS only) (all in conda base environment).
 
 ## Key Constraints
 

@@ -8,12 +8,11 @@ Captures camera feed, detects faces, encodes them through QPIXL quantum image
 compression, and displays the result with edge-detected artistic backgrounds.
 
 Usage:
-    python reality.py                          # Default: 4K, edges-black
+    python reality.py                          # Default: edges-white
     python reality.py --lite                   # Lightweight mode for low-spec hardware
     python reality.py --lite --fullscreen      # Lite + fullscreen
-    python reality.py --bg edges-white         # White background with dark edges
+    python reality.py --bg edges-black         # Black background with white edges
     python reality.py --bg passthrough         # No edge detection, raw camera bg
-    python reality.py --resolution 1920 1080   # Custom display resolution
     python reality.py --fullscreen             # Start in fullscreen
     python reality.py --test                   # Static test mode (no camera)
     python reality.py --verbose                # Print FPS and timing info
@@ -21,8 +20,10 @@ Usage:
 """
 
 import argparse
+import AppKit
 import cv2
 import numpy as np
+import objc
 import threading
 import time
 
@@ -119,7 +120,7 @@ class EdgeDetector:
         self._interval = cache_interval
         self._kernel = np.ones((3, 3), np.uint8)
 
-    def process(self, frame, mode="edges-black"):
+    def process(self, frame, mode="edges-white"):
         """Return edge-detected background. mode: edges-black | edges-white | passthrough"""
         if mode == "passthrough":
             return frame.copy()
@@ -418,36 +419,11 @@ def _draw_panel(frame, face_id, coords, ops, scale):
                     cv2.FONT_HERSHEY_SIMPLEX, fs, c, max(1, int(2 * scale)))
         ty += lh
 
-    fcx, fcy = x + w // 2, y + h // 2
     pcx = px if px > x else px2
     pcy = py + int(50 * scale)
+    fcx = x + w if px > x else x
+    fcy = min(max(pcy, y), y + h)
     cv2.line(frame, (fcx, fcy), (pcx, pcy), color, max(1, int(2 * scale)))
-
-
-def _draw_title(frame, scale):
-    """Draw centred title and subtitle."""
-    fh, fw = frame.shape[:2]
-    title = "REALITY IS NOT WHAT IT SEEMS"
-    fs = 1.8 * scale
-    th = max(2, int(4 * scale))
-    (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
-    tx = (fw - tw) // 2
-    ty = int(70 * scale)
-    cv2.putText(frame, title, (tx + 2, ty + 2),
-                cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2)
-    cv2.putText(frame, title, (tx, ty),
-                cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th)
-
-    sub = "View reality through quantum algorithm."
-    fs2 = 0.9 * scale
-    th2 = max(1, int(2 * scale))
-    (sw, _), _ = cv2.getTextSize(sub, cv2.FONT_HERSHEY_SIMPLEX, fs2, th2)
-    sx = (fw - sw) // 2
-    sy = ty + int(45 * scale)
-    cv2.putText(frame, sub, (sx + 1, sy + 1),
-                cv2.FONT_HERSHEY_SIMPLEX, fs2, (0, 0, 0), th2 + 1)
-    cv2.putText(frame, sub, (sx, sy),
-                cv2.FONT_HERSHEY_SIMPLEX, fs2, (255, 255, 0), th2)
 
 
 def _draw_face_count(frame, count, scale):
@@ -458,10 +434,20 @@ def _draw_face_count(frame, count, scale):
                     cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), max(1, int(3 * scale)))
 
 
+class _Picture(AppKit.NSView):
+    """Image view that stays centred in the window content."""
+
+    def setFrame_(self, rect):
+        # OpenCV sets the aspect-fitted size at the content origin on every imshow and resize
+        s = self.superview().frame().size
+        rect.origin.x = (s.width - rect.size.width) / 2
+        rect.origin.y = (s.height - rect.size.height) / 2
+        objc.super(_Picture, self).setFrame_(rect)
+
+
 class InstallationProcessor:
     def __init__(self, args):
         self.bg_mode = args.bg
-        self.display_res = tuple(args.resolution)
         self.compression = args.compression
         self.verbose = args.verbose
         self.start_fullscreen = args.fullscreen
@@ -607,7 +593,8 @@ class InstallationProcessor:
                             self._success += 1
 
                     target = output[y : y + h, x : x + w]
-                    resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]))
+                    resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]),
+                                         interpolation=cv2.INTER_NEAREST)
                     if resized.shape == target.shape:
                         output[y : y + h, x : x + w] = resized
 
@@ -629,12 +616,7 @@ class InstallationProcessor:
                     ops = self.qpixl.tracker.get(fid)
                     _draw_panel(output, fid, face["coords"], ops, scale)
 
-            _draw_title(output, scale)
             _draw_face_count(output, len(tracked), scale)
-
-            # 4. Upscale to display resolution ONCE
-            if (output.shape[1], output.shape[0]) != self.display_res:
-                output = cv2.resize(output, self.display_res)
 
             self._latest_output.put(output)
 
@@ -665,10 +647,9 @@ class InstallationProcessor:
             print("=" * 50)
             print("Reality is Not What It Seems")
             print("=" * 50)
-            print(f"Display: {self.display_res[0]}x{self.display_res[1]}")
             print(f"Background: {self.bg_mode}")
             print(f"Compression: {self.compression}%")
-            print("Controls: q=quit  f=fullscreen  o=toggle panels  v=verbose")
+            print("Controls: q=quit  f=fullscreen  esc=leave fullscreen  o=toggle panels  v=verbose")
             print("=" * 50)
 
         self._running = True
@@ -679,25 +660,37 @@ class InstallationProcessor:
         proc.start()
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        window = next(w for w in AppKit.NSApp().windows() if w.title() == WINDOW_NAME)
+        window.setBackgroundColor_(AppKit.NSColor.whiteColor())
+        # OpenCV draws into the content view's imageView and creates one only if unset
+        picture = _Picture.alloc().init()
+        picture.setWantsLayer_(True)
+        window.contentView().addSubview_(picture)
+        window.contentView().setImageView_(picture)
+        # First frame sizes the window; content height is 0 before it
+        cv2.imshow(WINDOW_NAME, np.full((self._cam_height, self._cam_width, 3), 255, np.uint8))
+        cv2.waitKey(1)
+        # Native toggle: OpenCV's resizes the window to the screen first and never restores it
+        window.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorFullScreenPrimary)
         if self.start_fullscreen:
-            cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            window.toggleFullScreen_(None)
 
-        last_display = None
+        last_toggle = 0.0
         try:
             while self._running:
                 output = self._latest_output.get()
                 if output is not None:
-                    last_display = output
-                if last_display is not None:
-                    cv2.imshow(WINDOW_NAME, last_display)
+                    cv2.imshow(WINDOW_NAME, output)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                elif key == ord("f"):
-                    prop = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
-                    new = cv2.WINDOW_NORMAL if prop == cv2.WINDOW_FULLSCREEN else cv2.WINDOW_FULLSCREEN
-                    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, new)
+                elif key in (ord("f"), 27) and time.time() - last_toggle > 2.0:
+                    # 2 s covers one transition; macOS queues presses made during it
+                    full = window.styleMask() & AppKit.NSWindowStyleMaskFullScreen
+                    if key == ord("f") or full:
+                        window.toggleFullScreen_(None)
+                        last_toggle = time.time()
                 elif key == ord("o"):
                     self.show_panels = not self.show_panels
                 elif key == ord("v"):
@@ -773,7 +766,8 @@ def run_test(args):
 
         proc_bgr = cv2.cvtColor(gray_face, cv2.COLOR_GRAY2BGR)
         target = output[y : y + h, x : x + w]
-        resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]))
+        resized = cv2.resize(proc_bgr, (target.shape[1], target.shape[0]),
+                             interpolation=cv2.INTER_NEAREST)
         if resized.shape == target.shape:
             output[y : y + h, x : x + w] = resized
 
@@ -781,7 +775,6 @@ def run_test(args):
         ops = proc.tracker.get(fid)
         _draw_panel(output, fid, face["coords"], ops, scale)
 
-    _draw_title(output, output.shape[0] / 1080.0)
     _draw_face_count(output, len(faces), output.shape[0] / 1080.0)
 
     cv2.imwrite("test_output.png", output)
@@ -792,11 +785,9 @@ def run_test(args):
 def main():
     p = argparse.ArgumentParser(description="Reality is Not What It Seems — QPIXL installation")
     p.add_argument("--bg", choices=["edges-black", "edges-white", "passthrough"],
-                    default="edges-black", help="Background mode (default: edges-black)")
-    p.add_argument("--resolution", type=int, nargs=2, default=None,
-                    metavar=("W", "H"), help="Display resolution (default: 3840x2160, lite: 1280x720)")
+                    default="edges-white", help="Background mode (default: edges-white)")
     p.add_argument("--compression", type=int, default=None,
-                    help="QPIXL compression 0-100 (default: 40, lite: 70)")
+                    help="QPIXL compression 0-100 (default: 95, lite: 70)")
     p.add_argument("--verbose", action="store_true", help="Print FPS and debug info")
     p.add_argument("--fullscreen", action="store_true", help="Start in fullscreen")
     p.add_argument("--test", action="store_true", help="Run static pipeline test (no camera)")
@@ -804,20 +795,11 @@ def main():
                     help="Image file for --test mode (optional)")
     p.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
     p.add_argument("--lite", action="store_true",
-                    help="Lightweight mode for low-spec hardware (16x16 faces, 720p, lower camera res)")
+                    help="Lightweight mode for low-spec hardware (16x16 faces, lower camera res)")
     args = p.parse_args()
 
-    # Apply lite defaults (user-specified values take priority)
-    if args.lite:
-        if args.resolution is None:
-            args.resolution = [1280, 720]
-        if args.compression is None:
-            args.compression = 70
-    else:
-        if args.resolution is None:
-            args.resolution = [3840, 2160]
-        if args.compression is None:
-            args.compression = 40
+    if args.compression is None:
+        args.compression = 70 if args.lite else 95
 
     if args.test:
         run_test(args)
