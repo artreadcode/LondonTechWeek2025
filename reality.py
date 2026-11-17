@@ -17,6 +17,7 @@ Usage:
     python reality.py --test photo.jpg         # Static test on a photo (no camera)
     python reality.py --verbose                # Print FPS and timing info
     python reality.py --camera 1               # Use camera index 1
+    python reality.py --mirror                 # Flip the camera picture left to right
 """
 
 import argparse
@@ -420,6 +421,7 @@ class InstallationProcessor:
         self.show_panels = True
         self.lite = getattr(args, "lite", False)
         self.camera = args.camera
+        self.mirror = args.mirror
 
         if self.lite:
             self.face_detector = FaceDetector(detect_width=320)
@@ -470,7 +472,7 @@ class InstallationProcessor:
 
             ret, frame = cap.read()
             if ret:
-                self._latest_input.put(frame)
+                self._latest_input.put(cv2.flip(frame, 1) if self.mirror else frame)
                 fail_count = 0
             else:
                 fail_count += 1
@@ -737,6 +739,7 @@ def main():
     p.add_argument("--test", metavar="PHOTO",
                     help="Run the pipeline once on a photo with a face (no camera)")
     p.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    p.add_argument("--mirror", action="store_true", help="Flip the camera picture left to right")
     p.add_argument("--lite", action="store_true",
                     help="Lightweight mode for low-spec hardware (16x16 faces, lower camera res)")
     args = p.parse_args()

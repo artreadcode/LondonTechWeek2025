@@ -66,6 +66,7 @@ uv run --locked reality.py --test photo.jpg
 | `--bg passthrough` | Raw camera feed as background |
 | `--compression N` | QPIXL compression 0–100 (default: 95, lite: 70) |
 | `--camera N` | Camera index (default: 0) |
+| `--mirror` | Flip the camera picture left to right |
 | `--fullscreen` | Start in fullscreen |
 | `--lite` | Lightweight mode: 16×16 faces, 640×480 camera |
 | `--verbose` | Print FPS and timing info |
