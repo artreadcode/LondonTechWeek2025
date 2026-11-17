@@ -11,7 +11,7 @@ The pixelation isn't a glitch. It's what a quantum computer would "see" if it st
 The installation runs a live pipeline from camera to display:
 
 ### 1. Capture & Detect
-A webcam captures the scene. OpenCV's Haar cascade detects faces on a downscaled frame for speed, then coordinates are mapped back to full resolution.
+A webcam captures the scene. YuNet, a small neural face detector run through OpenCV, finds faces on a downscaled frame for speed, including tilted, turned and partly covered ones. Coordinates are then mapped back to full resolution.
 
 ### 2. Quantum Encoding (QPIXL)
 Each detected face is resized to 32×32 grayscale and encoded using **QPIXL** — a quantum image compression algorithm based on [this Nature paper](https://www.nature.com/articles/s41598-022-11024-y) (compressed FRQI). The steps:
@@ -25,7 +25,7 @@ Each detected face is resized to 32×32 grayscale and encoded using **QPIXL** �
 For a 32×32 face at 95% compression, this produces an 11-qubit circuit with 52 RY gates at depth ~170.
 
 ### 3. Simulate & Decode
-The circuit runs on Qiskit Aer's statevector simulator, producing 2048 complex amplitudes. The decoder takes the 2048 probabilities, applies `arctan2` to each pair and rescales the result to 0–255.
+The circuit runs on Qiskit Aer's statevector simulator, producing 2048 complex amplitudes. The decoder takes the square root of the 2048 probabilities (the amplitudes), applies `arctan2` to each pair to recover the pixel angle, and rescales the result to 0–255.
 
 ### 4. Display
 The quantum-reconstructed greyscale face is stamped onto an edge-detected background. A HUD panel next to each face shows the live quantum circuit parameters — the actual `ry(angle, q0)` rotation gates that encoded that person's face.
@@ -47,17 +47,14 @@ Without uv: `pip install -r requirements.txt` in a Python 3.12 environment, then
 ## Running
 
 ```bash
-# Static pipeline test (no camera needed)
-uv run --locked reality.py --test
-
 # Find the camera: prints the opened index and resolution
 uv run --locked reality.py --camera 0 --verbose
 
 # Exhibition mode (fullscreen, no sleep)
 caffeinate -di uv run --locked reality.py --camera 0 --fullscreen
 
-# Test with a specific image
-uv run --locked reality.py --test --test-image photo.jpg
+# Static pipeline test on a photo with a face (no camera needed)
+uv run --locked reality.py --test photo.jpg
 ```
 
 ### Options
@@ -101,4 +98,5 @@ After changing a dependency: `uv lock`, then `uv export --format requirements.tx
 
 - **`reality.py`** — Main installation application
 - **`lib/qpixl.py`** — QPIXL algorithm: builds compressed FRQI quantum circuits from image data
+- **`models/face_detection_yunet_2023mar.onnx`** — YuNet face detection model from [opencv_zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) (MIT licence)
 - **`lib/helper.py`** — Support functions: Walsh-Hadamard transform, Gray code, angle conversion, statevector decoding, image reconstruction

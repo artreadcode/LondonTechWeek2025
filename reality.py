@@ -14,7 +14,7 @@ Usage:
     python reality.py --bg edges-black         # Black background with white edges
     python reality.py --bg passthrough         # No edge detection, raw camera bg
     python reality.py --fullscreen             # Start in fullscreen
-    python reality.py --test                   # Static test mode (no camera)
+    python reality.py --test photo.jpg         # Static test on a photo (no camera)
     python reality.py --verbose                # Print FPS and timing info
     python reality.py --camera 1               # Use camera index 1
 """
@@ -24,6 +24,7 @@ import AppKit
 import cv2
 import numpy as np
 import objc
+import os
 import threading
 import time
 
@@ -33,6 +34,9 @@ import lib.qpixl as qpixl
 from qiskit_aer import Aer
 
 WINDOW_NAME = "Reality?"
+QPIXL_PER_FRAME = 2
+FACE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "models", "face_detection_yunet_2023mar.onnx")
 
 
 class LatestFrame:
@@ -112,7 +116,7 @@ class QuantumOperationTracker:
 
 
 class EdgeDetector:
-    def __init__(self, cache_interval=0.1):
+    def __init__(self, cache_interval=0.0):
         self._cache = None
         self._cache_time = 0.0
         self._interval = cache_interval
@@ -142,10 +146,9 @@ class EdgeDetector:
 
 
 class FaceDetector:
-    def __init__(self, min_face=(30, 30), detect_width=640):
-        self._cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
+    def __init__(self, min_face=34, detect_width=640, score=0.6):
+        # YuNet: finds tilted, turned and partly covered faces, unlike a Haar cascade
+        self._net = cv2.FaceDetectorYN.create(FACE_MODEL, "", (detect_width, detect_width), score)
         self._min_face = min_face
         self._detect_width = detect_width
 
@@ -154,19 +157,14 @@ class FaceDetector:
         h, w = frame.shape[:2]
         scale = self._detect_width / w
         small = cv2.resize(frame, (self._detect_width, int(h * scale)))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
-        faces = self._cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.15,
-            minNeighbors=5,
-            minSize=self._min_face,
-            flags=cv2.CASCADE_SCALE_IMAGE,
-        )
+        self._net.setInputSize((small.shape[1], small.shape[0]))
+        _, faces = self._net.detect(small)
 
         results = []
         inv_scale = 1.0 / scale
-        for fx, fy, fw, fh in faces:
+        for fx, fy, fw, fh in ([] if faces is None else faces[:, :4]):
+            if max(fw, fh) < self._min_face:
+                continue
             ox = int(fx * inv_scale)
             oy = int(fy * inv_scale)
             ow = int(fw * inv_scale)
@@ -174,14 +172,10 @@ class FaceDetector:
 
             size = max(ow, oh)
             cx, cy = ox + ow // 2, oy + oh // 2
-            nx = max(0, cx - size // 2)
-            ny = max(0, cy - size // 2)
-
-            if nx + size > w or ny + size > h:
-                continue
+            size = min(size, w, h)
+            nx = min(max(0, cx - size // 2), w - size)
+            ny = min(max(0, cy - size // 2), h - size)
             region = frame[ny : ny + size, nx : nx + size]
-            if region.size == 0:
-                continue
             results.append({"region": region, "coords": (nx, ny, size, size)})
         return results
 
@@ -268,13 +262,13 @@ class QPIXLProcessor:
         resized = cv2.resize(gray, (sz, sz)).astype(np.float64)
         resized = np.clip(resized, 0, 255)
 
-        # Guard against degenerate images
-        lo, hi = resized.min(), resized.max()
+        # Percentiles: a small glint or lamp in the crop must not darken the whole face
+        lo, hi = np.percentile(resized, (2, 98))
         if hi == lo:
             resized += np.random.uniform(-2, 2, resized.shape)
             resized = np.clip(resized, 1, 254)
             lo, hi = resized.min(), resized.max()
-        resized = 1 + (resized - lo) * 253 / (hi - lo)
+        resized = np.clip(1 + (resized - lo) * 253 / (hi - lo), 1, 254)
         flat = resized.astype(np.uint8).flatten().astype(np.float64)
         return hlp.pad_0(flat), (sz, sz)
 
@@ -289,7 +283,8 @@ class QPIXLProcessor:
             self.tracker.analyze_circuit(circuit, face_id)
 
             sv = self.backend.run(circuit).result().get_statevector()
-            return hlp.decodeQPIXL(sv.probabilities(), min_pixel_val=0, max_pixel_val=255)
+            # Amplitudes are (cos, sin) of the pixel angle; probabilities are their squares
+            return hlp.decodeQPIXL(np.sqrt(sv.probabilities()), min_pixel_val=0, max_pixel_val=255)
         except Exception as e:
             if self.verbose:
                 print(f"  QPIXL error face {face_id}: {e}")
@@ -427,18 +422,16 @@ class InstallationProcessor:
         self.camera = args.camera
 
         if self.lite:
-            self.face_detector = FaceDetector(detect_width=320, min_face=(30, 30))
+            self.face_detector = FaceDetector(detect_width=320)
             self.qpixl = QPIXLProcessor(self.compression, self.verbose,
                                          face_size=16)
             self.edge_detector = EdgeDetector(cache_interval=0.5)
-            self._cache_timeout = 5.0
             self._cam_width = 640
             self._cam_height = 480
         else:
             self.face_detector = FaceDetector()
             self.qpixl = QPIXLProcessor(self.compression, self.verbose)
             self.edge_detector = EdgeDetector()
-            self._cache_timeout = 2.0
             self._cam_width = 1920
             self._cam_height = 1080
 
@@ -468,10 +461,12 @@ class InstallationProcessor:
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._cam_height)
                 cap.set(cv2.CAP_PROP_FPS, 30)
                 fail_count = 0
-                if self.verbose:
+                if self.verbose and cap.isOpened():
                     w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
                     h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
                     print(f"Camera {self.camera} opened: {w:.0f}x{h:.0f}")
+                elif self.verbose:
+                    print(f"Camera {self.camera} not available, retrying...")
 
             ret, frame = cap.read()
             if ret:
@@ -524,6 +519,9 @@ class InstallationProcessor:
 
             now = time.time()
             active_ids = set()
+            # Bounded work: re-encode only the faces with the oldest picture
+            oldest = sorted(tracked, key=lambda f: self._face_cache.get(f["id"], {"time": 0})["time"])
+            refresh = {f["id"] for f in oldest[:QPIXL_PER_FRAME]}
 
             for face in tracked:
                 fid = face["id"]
@@ -535,16 +533,10 @@ class InstallationProcessor:
 
                     cv2.rectangle(output, (x, y), (x + w, y + h), color, max(2, w // 40))
 
-                    # Cache lookup — invalidate on timeout OR significant movement
-                    ckey = str(fid)
-                    cached = self._face_cache.get(ckey)
-                    cache_hit = False
-                    if cached and now - cached["time"] < self._cache_timeout:
-                        ox, oy = cached.get("pos", (x, y))
-                        if abs(x - ox) < 40 and abs(y - oy) < 40:
-                            cache_hit = True
-                    if cache_hit:
-                        proc_bgr = cached["img"]
+                    if fid not in refresh:
+                        if fid not in self._face_cache:
+                            continue
+                        proc_bgr = self._face_cache[fid]["img"]
                     else:
                         padded, shape = self.qpixl.prepare(region)
                         decoded = self.qpixl.process(padded, fid)
@@ -559,7 +551,7 @@ class InstallationProcessor:
                         hsv[:, :, 2] = np.clip(hsv[:, :, 2] * 1.1, 0, 255).astype(np.uint8)
                         proc_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-                        self._face_cache[ckey] = {"img": proc_bgr, "time": now, "pos": (x, y)}
+                        self._face_cache[fid] = {"img": proc_bgr, "time": now}
                         with self._stats_lock:
                             self._success += 1
 
@@ -575,7 +567,7 @@ class InstallationProcessor:
                     with self._stats_lock:
                         self._errors += 1
 
-            self._cleanup_cache(now)
+            self._face_cache = {k: v for k, v in self._face_cache.items() if k in active_ids}
             self.qpixl.tracker.clear_stale(active_ids)
 
             # HUD scale factor (relative to 1080p)
@@ -599,12 +591,6 @@ class InstallationProcessor:
                       f"Faces: {len(tracked)}")
                 fps_count = 0
                 fps_time = time.time()
-
-    def _cleanup_cache(self, now):
-        stale = [k for k, v in self._face_cache.items()
-                 if now - v["time"] > self._cache_timeout * 2]
-        for k in stale:
-            del self._face_cache[k]
 
     def run(self):
         if self.lite:
@@ -679,23 +665,13 @@ class InstallationProcessor:
 
 
 def run_test(args):
-    """Run the full pipeline on a static image or generated test pattern."""
+    """Run the full pipeline on a photo."""
     print("=== Static Pipeline Test ===\n")
 
-    if args.test_image:
-        img = cv2.imread(args.test_image)
-        if img is None:
-            print(f"Error: cannot read {args.test_image}")
-            return
-        print(f"Loaded: {args.test_image}  ({img.shape[1]}x{img.shape[0]})")
-    else:
-        img = np.zeros((480, 640, 3), dtype=np.uint8)
-        img[:] = (80, 80, 80)
-        cv2.ellipse(img, (320, 240), (80, 100), 0, 0, 360, (200, 180, 160), -1)
-        cv2.circle(img, (295, 220), 10, (50, 50, 50), -1)  # left eye
-        cv2.circle(img, (345, 220), 10, (50, 50, 50), -1)  # right eye
-        cv2.ellipse(img, (320, 270), (25, 10), 0, 0, 360, (100, 80, 80), -1)  # mouth
-        print("Using generated test pattern (640x480)")
+    img = cv2.imread(args.test)
+    if img is None:
+        raise SystemExit(f"Cannot read {args.test}")
+    print(f"Loaded: {args.test}  ({img.shape[1]}x{img.shape[0]})")
 
     edge_det = EdgeDetector()
     t0 = time.time()
@@ -710,10 +686,7 @@ def run_test(args):
     print(f"[2] Face detection: {t_face * 1000:.1f} ms  ({len(faces)} faces found)")
 
     if not faces:
-        print("\nNo faces detected. Saving edge-detected background only.")
-        cv2.imwrite("test_output.png", bg)
-        print("Saved: test_output.png")
-        return
+        raise SystemExit(f"No face detected in {args.test}")
 
     lite = getattr(args, "lite", False)
     face_size = 16 if lite else 32
@@ -761,9 +734,8 @@ def main():
                     help="QPIXL compression 0-100 (default: 95, lite: 70)")
     p.add_argument("--verbose", action="store_true", help="Print FPS and debug info")
     p.add_argument("--fullscreen", action="store_true", help="Start in fullscreen")
-    p.add_argument("--test", action="store_true", help="Run static pipeline test (no camera)")
-    p.add_argument("--test-image", type=str, default=None,
-                    help="Image file for --test mode (optional)")
+    p.add_argument("--test", metavar="PHOTO",
+                    help="Run the pipeline once on a photo with a face (no camera)")
     p.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
     p.add_argument("--lite", action="store_true",
                     help="Lightweight mode for low-spec hardware (16x16 faces, lower camera res)")
